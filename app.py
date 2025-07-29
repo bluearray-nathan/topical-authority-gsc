@@ -15,33 +15,41 @@ from google import genai
 from google.genai.types import EmbedContentConfig
 
 # ── 1) Load credentials from Streamlit secrets ─────────────────────────
-# The .streamlit/secrets.toml must define a [vertex_ai] table with each
-# service‐account field AND a "region" key, plus an [openai] table.
-
 vertex_secrets = st.secrets["vertex_ai"]
-# Extract region separately for Vertex AI init:
-region = vertex_secrets.pop("region", "us-central1")
-# Prepare a clean dict for the service account JSON:
+
+# Read region (if provided) without popping
+region = vertex_secrets.get("region", "us-central1")
+
+# Filter out the region key and build a plain dict for JSON dump
 service_account_info = {
-    k: v for k, v in vertex_secrets.items()
+    k: v
+    for k, v in vertex_secrets.items()
     if k in {
-        "type", "project_id", "private_key_id", "private_key",
-        "client_email", "client_id", "auth_uri", "token_uri",
-        "auth_provider_x509_cert_url", "client_x509_cert_url",
-        "universe_domain"
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+        "universe_domain",
     }
 }
-# Write it to a temp file:
+
+# Write the service account file
 with open("/tmp/sa.json", "w") as f:
     json.dump(service_account_info, f)
 
-# Point GCP libraries to it:
+# Point GCP & GenAI at it
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/sa.json"
-os.environ["GOOGLE_CLOUD_PROJECT"]      = service_account_info["project_id"]
-os.environ["GOOGLE_CLOUD_LOCATION"]     = region
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+os.environ["GOOGLE_CLOUD_PROJECT"]          = service_account_info["project_id"]
+os.environ["GOOGLE_CLOUD_LOCATION"]         = region
+os.environ["GOOGLE_GENAI_USE_VERTEXAI"]     = "True"
 
-# Load OpenAI key from secrets:
+# Load OpenAI key from secrets
 os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 
 # ── 2) Initialize clients ─────────────────────────────────────────────
@@ -56,8 +64,8 @@ client       = OpenAI()
 st.sidebar.header("🔧 Clustering Settings")
 min_cluster_size      = st.sidebar.slider("HDBSCAN min_cluster_size", 2, 100, 15)
 min_samples           = st.sidebar.slider("HDBSCAN min_samples", 1, 10, 2)
-cluster_eps           = st.sidebar.slider("ε (cluster_selection_epsilon)", 0.0, 1.0, 0.1)
-post_assign_threshold = st.sidebar.slider("Noise→Cluster sim threshold", 0.5, 0.9, 0.7)
+cluster_eps           = st.sidebar.slider("HDBSCAN ε (cluster_selection_epsilon)", 0.0, 1.0, 0.1)
+post_assign_threshold = st.sidebar.slider("Noise→Cluster sim thresh", 0.5, 0.9, 0.7)
 
 # ── 4) App UI & CSV upload ────────────────────────────────────────────
 st.title("🔍 GSC‑to‑Topics Streamlit App")
@@ -199,4 +207,5 @@ st.download_button(
     "keywords_with_topics.csv",
     "text/csv"
 )
+
 
