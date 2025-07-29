@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scikit-learn>=1.2,<1.7
+hdbscan==0.8.40
+tqdm
+openai
+google-cloud-aiplatform
+google-genai
