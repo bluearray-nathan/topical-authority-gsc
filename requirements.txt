@@ -8,7 +8,7 @@
 \f0\fs24 \cf0 streamlit\
 pandas\
 numpy\
-scikit-learn\
+scikit-learn>=1.2,<1.7\
 hdbscan\
 tqdm\
 openai\
