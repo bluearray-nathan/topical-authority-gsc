@@ -1,6 +1,7 @@
 # app.py
 
 import os
+import io
 import json
 import streamlit as st
 import pandas as pd
@@ -9,28 +10,26 @@ from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 import hdbscan
 from openai import OpenAI
-from google.cloud import aiplatform
+from google.cloud import aiplatform, storage
 from google import genai
 from google.genai.types import EmbedContentConfig
 
 # ── 1) Load credentials from Streamlit secrets ─────────────────────────
-# Convert secrets AttrDict to a real dict
-vertex_secret = dict(st.secrets["vertex_ai"])
-# Extract and remove region
-region = vertex_secret.get("region", "us-central1")
-vertex_secret.pop("region", None)
+vertex_secret = dict(st.secrets["vertex_ai"])          # copy AttrDict → dict
+region        = vertex_secret.get("region", "us-central1")
+vertex_secret.pop("region", None)                      # remove before writing
 
-# Write service account JSON to disk
+# write SA JSON to disk
 with open("/tmp/sa.json", "w") as f:
     json.dump(vertex_secret, f)
 
-# Set environment variables for Vertex AI
+# set env vars for Vertex AI & GenAI SDK
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/sa.json"
 os.environ["GOOGLE_CLOUD_PROJECT"]          = vertex_secret["project_id"]
 os.environ["GOOGLE_CLOUD_LOCATION"]         = region
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"]     = "True"
 
-# Set OpenAI API key
+# set OpenAI key
 os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 
 # ── 2) Initialize clients ──────────────────────────────────────────────
@@ -38,13 +37,35 @@ aiplatform.init(
     project=vertex_secret["project_id"],
     location=region
 )
-genai_client   = genai.Client()
-openai_client  = OpenAI()
+genai_client  = genai.Client()
+openai_client = OpenAI()
 
-# ── 3) Caching helper for batch embeddings ─────────────────────────────
+# ── 3) Set up GCS bucket for durable cache ────────────────────────────
+# Replace with your actual bucket name (must already exist)
+BUCKET_NAME     = "my-embedding-cache"
+storage_client  = storage.Client()
+bucket          = storage_client.bucket(BUCKET_NAME)
+
+def load_saved_batch(i: int) -> np.ndarray | None:
+    """Load batch_{i}.npy from GCS if it exists, else return None."""
+    blob = bucket.blob(f"batch_{i}.npy")
+    if not blob.exists():
+        return None
+    data = blob.download_as_bytes()
+    return np.load(io.BytesIO(data), allow_pickle=False)
+
+def save_batch(i: int, arr: np.ndarray):
+    """Save arr to GCS as batch_{i}.npy."""
+    buf  = io.BytesIO()
+    np.save(buf, arr, allow_pickle=False)
+    buf.seek(0)
+    blob = bucket.blob(f"batch_{i}.npy")
+    blob.upload_from_file(buf, content_type="application/octet-stream")
+
+# ── 4) Caching helper for small local cache (optional) ────────────────
 @st.cache_data(show_spinner=False)
-def embed_batch(texts: tuple[str, ...]) -> np.ndarray:
-    """Embed a tuple of queries via Vertex AI and cache the result."""
+def embed_batch_local(texts: tuple[str, ...]) -> np.ndarray:
+    """Embed a tuple of texts via Vertex AI and cache locally."""
     embs = []
     for txt in texts:
         resp = genai_client.models.embed_content(
@@ -58,27 +79,27 @@ def embed_batch(texts: tuple[str, ...]) -> np.ndarray:
         embs.append(resp.embeddings[0].values)
     return np.array(embs)
 
-# ── 4) Sidebar controls & progress placeholders ───────────────────────
+# ── 5) Sidebar settings & progress placeholders ────────────────────────
 st.sidebar.header("🔧 Settings")
 min_cluster_size      = st.sidebar.slider("HDBSCAN min_cluster_size", 2, 100, 15)
-min_samples           = st.sidebar.slider("HDBSCAN min_samples", 1, 10, 2)
+min_samples           = st.sidebar.slider("HDBSCAN min_samples",       1, 10, 2)
 cluster_eps           = st.sidebar.slider("ε (cluster_selection_epsilon)", 0.0, 1.0, 0.1)
 post_assign_threshold = st.sidebar.slider("Noise→Cluster sim threshold", 0.0, 1.0, 0.7)
 batch_size            = st.sidebar.number_input("Embedding batch size", 100, 5000, 500, 100)
 embed_bar             = st.sidebar.progress(0)
 embed_status          = st.sidebar.empty()
 
-# ── 5) Upload CSV ─────────────────────────────────────────────────────
+# ── 6) Upload CSV ─────────────────────────────────────────────────────
 st.title("🔍 GSC‑to‑Topics Streamlit App")
-uploaded = st.file_uploader("Upload your GSC CSV", type="csv")
+uploaded = st.file_uploader("Upload your Google Search Console CSV", type="csv")
 if not uploaded:
     st.info("Awaiting upload…")
     st.stop()
 
 df = pd.read_csv(uploaded)
-st.write("Data sample:", df.head())
+st.write("Raw data sample:", df.head())
 
-# ── 6) Clean & normalize ──────────────────────────────────────────────
+# ── 7) Clean & normalize ──────────────────────────────────────────────
 df = df.rename(columns={
     "Query":       "query",
     "Clicks":      "clicks",
@@ -95,30 +116,40 @@ df["ctr"] = (
 for col in ["clicks", "impressions", "avg_pos"]:
     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-# ── 7) Batch‑embed with caching & progress ────────────────────────────
-queries = df["query"].astype(str).tolist()
-total   = len(queries)
+# ── 8) Batch‑embed with durable GCS resume ─────────────────────────────
+queries  = df["query"].astype(str).tolist()
+total    = len(queries)
 all_embs = []
 
 for i in range(0, total, batch_size):
     start, end = i, min(i + batch_size, total)
-    embed_status.text(f"Embedding {start+1}–{end} of {total}")
-    batch = tuple(queries[start:end])
-    batch_embs = embed_batch(batch)       # cached call
+    embed_status.text(f"Batch {start+1}–{end} of {total}")
+
+    # 1) Try loading from GCS
+    saved = load_saved_batch(i)
+    if saved is not None:
+        batch_embs = saved
+    else:
+        # 2) Compute via Vertex AI (with local caching)
+        batch      = tuple(queries[start:end])
+        batch_embs = embed_batch_local(batch)
+        # 3) Persist to GCS for future runs
+        save_batch(i, batch_embs)
+
     all_embs.extend(batch_embs)
     embed_bar.progress(end / total)
 
 embeddings = np.array(all_embs)
 embed_bar.empty()
 embed_status.empty()
-st.success("✅ Embeddings complete")
+st.success("✅ Embeddings complete (GCS‑backed)")
 
-# ── 8) PCA reduction ─────────────────────────────────────────────────
+# ── 9) PCA reduction ─────────────────────────────────────────────────
 with st.spinner("Running PCA…"):
     coords = PCA(n_components=20, random_state=42).fit_transform(embeddings)
 st.success("✅ PCA complete")
 
-# ── 9) HDBSCAN clustering ─────────────────────────────────────────────
+# ──10) HDBSCAN clustering ─────────────────────────────────────────────
 with st.spinner("Clustering…"):
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
@@ -131,7 +162,7 @@ n_clusters = len(set(df["cluster"])) - (1 if -1 in df["cluster"] else 0)
 n_noise    = int((df["cluster"] == -1).sum())
 st.success(f"✅ Found {n_clusters} clusters (+{n_noise} noise)")
 
-# ── 10) Re‑assign noise via cosine similarity ─────────────────────────
+# ──11) Re‑assign noise via cosine similarity ──────────────────────────
 with st.spinner("Re‑assigning noise…"):
     centroids = {
         cid: coords[idxs].mean(axis=0)
@@ -142,8 +173,10 @@ with st.spinner("Re‑assigning noise…"):
         if df.at[i, "cluster"] != -1:
             return df.at[i, "cluster"]
         vec  = coords[i].reshape(1, -1)
-        sims = {cid: cosine_similarity(vec, centroids[cid].reshape(1, -1))[0][0]
-                for cid in centroids}
+        sims = {
+            cid: cosine_similarity(vec, centroids[cid].reshape(1, -1))[0][0]
+            for cid in centroids
+        }
         best, score = max(sims.items(), key=lambda x: x[1])
         return best if score >= post_assign_threshold else -1
 
@@ -151,7 +184,7 @@ with st.spinner("Re‑assigning noise…"):
 
 st.success("✅ Noise re‑assigned")
 
-# ── 11) GPT‑label clusters ────────────────────────────────────────────
+# ──12) GPT‑label clusters ─────────────────────────────────────────────
 cluster_ids = sorted(df["cluster"].unique())
 label_bar   = st.progress(0)
 labels_map  = {}
@@ -162,7 +195,7 @@ for idx, cid in enumerate(cluster_ids):
     else:
         with st.spinner(f"Labeling cluster {cid}…"):
             sample = df[df.cluster == cid]["query"].tolist()[:10]
-            prompt = "Here are some queries:\n" + "\n".join(f"- {q}" for q in sample)
+            prompt = "Here are some search queries:\n" + "\n".join(f"- {q}" for q in sample)
             prompt += "\n\nProvide a concise topic name (3 words max):"
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -176,7 +209,7 @@ df["topic"] = df["cluster"].map(lambda c: labels_map.get(c, "Noise"))
 label_bar.empty()
 st.success("✅ Topics labeled")
 
-# ── 12) Super‑cluster topics ──────────────────────────────────────────
+# ──13) Super‑cluster & label ──────────────────────────────────────────
 with st.spinner("Super‑clustering…"):
     topic_texts = [t for t in df["topic"].unique() if t != "Noise"]
     topic_embs  = []
@@ -200,11 +233,8 @@ with st.spinner("Super‑clustering…"):
     super_map   = dict(zip(topic_texts, super_ids))
     df["super_id"] = df["topic"].map(lambda t: super_map.get(t, -1))
 
-st.success("✅ Super‑clustering complete")
-
-# ── 13) Label super‑clusters ─────────────────────────────────────────
-super_ids    = sorted(df["super_id"].unique())
-super_bar    = st.progress(0)
+super_ids = sorted(df["super_id"].unique())
+super_bar = st.progress(0)
 super_labels = {}
 
 for idx, sid in enumerate(super_ids):
@@ -227,8 +257,8 @@ df["super_topic"] = df["super_id"].map(lambda x: super_labels.get(x, "Misc"))
 super_bar.empty()
 st.success("✅ Super‑topics labeled")
 
-# ── 14) Display & download ───────────────────────────────────────────
-st.write("Final sample:", df[["query","topic","super_topic","clicks","impressions","ctr","avg_pos"]].head())
+# ──14) Display & download ─────────────────────────────────────────────
+st.write("Sample output:", df[["query","topic","super_topic","clicks","impressions","ctr","avg_pos"]].head())
 csv_data = df[["query","topic","super_topic","clicks","impressions","ctr","avg_pos"]].to_csv(index=False)
 st.download_button("⬇️ Download CSV", csv_data, "keywords_with_topics.csv", "text/csv")
 
