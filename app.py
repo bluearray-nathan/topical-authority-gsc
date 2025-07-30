@@ -1,254 +1,128 @@
-# app.py
-
-import os
-import io
-import json
-import hashlib
+import subprocess
+import sys
+# Install Playwright browser binaries if possible (non-fatal)
+subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 import streamlit as st
 import pandas as pd
-import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.metrics.pairwise import cosine_similarity
-import hdbscan
-from openai import OpenAI
-from google.cloud import aiplatform, storage
-from google import genai
-from google.genai.types import EmbedContentConfig
+import requests
+import re
+import json
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+import cloudscraper
+import openai
 
-# ── 1) Load credentials from Streamlit secrets ─────────────────────────
-vertex_secret = dict(st.secrets["vertex_ai"])          # copy AttrDict → dict
-region        = vertex_secret.get("region", "us-central1")
-vertex_secret.pop("region", None)                      # remove before writing
+# --- Streamlit UI ---
+st.set_page_config(page_title="Content Gap Audit", layout="wide")
+st.title("🔍 Content Gap Audit Tool")
 
-with open("/tmp/sa.json", "w") as f:
-    json.dump(vertex_secret, f)
+# Load API keys from Streamlit secrets
+openai.api_key      = st.secrets["openai"]["api_key"]
+gemini_api_key      = st.secrets["google"]["gemini_api_key"]
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/sa.json"
-os.environ["GOOGLE_CLOUD_PROJECT"]          = vertex_secret["project_id"]
-os.environ["GOOGLE_CLOUD_LOCATION"]         = region
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"]     = "True"
-
-os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
-
-# ── 2) Initialize clients ──────────────────────────────────────────────
-aiplatform.init(project=vertex_secret["project_id"], location=region)
-genai_client   = genai.Client()
-openai_client  = OpenAI()
-
-# ── 3) Set up GCS bucket for durable cache ────────────────────────────
-BUCKET_NAME    = "my-embedding-cache"   # ← replace with your bucket name
-storage_client = storage.Client()
-bucket         = storage_client.bucket(BUCKET_NAME)
-
-def load_saved_batch(prefix: str, i: int) -> np.ndarray | None:
-    """Load prefix/batch_{i}.npy from GCS if it exists, else return None."""
-    blob = bucket.blob(f"{prefix}batch_{i}.npy")
-    if not blob.exists():
-        return None
-    data = blob.download_as_bytes()
-    return np.load(io.BytesIO(data), allow_pickle=False)
-
-def save_batch(prefix: str, i: int, arr: np.ndarray):
-    """Save arr to GCS as prefix/batch_{i}.npy."""
-    buf  = io.BytesIO()
-    np.save(buf, arr, allow_pickle=False)
-    buf.seek(0)
-    blob = bucket.blob(f"{prefix}batch_{i}.npy")
-    blob.upload_from_file(buf, content_type="application/octet-stream")
-
-# ── 4) Local caching helper ────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def embed_batch_local(texts: tuple[str, ...]) -> np.ndarray:
-    """Embed a tuple of texts via Vertex AI and cache locally."""
-    embs = []
-    for txt in texts:
-        resp = genai_client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=txt,
-            config=EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=3072
-            )
+# Helper: extract H1 + headings via Playwright with fallback to cloudscraper
+def extract_h1_and_headings(url):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        st.warning(f"Playwright failed for {url}: {e}")
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
-        embs.append(resp.embeddings[0].values)
-    return np.array(embs)
+        try:
+            resp = scraper.get(url, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as e2:
+            st.warning(f"Scraper fallback failed for {url}: {e2}")
+            return "", []
+    h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+    headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(['h2','h3','h4'])]
+    return h1, headings
 
-# ── 5) Sidebar settings & progress placeholders ────────────────────────
-st.sidebar.header("🔧 Settings")
-min_cluster_size      = st.sidebar.slider("HDBSCAN min_cluster_size", 2, 100, 15)
-min_samples           = st.sidebar.slider("HDBSCAN min_samples",       1, 10, 2)
-cluster_eps           = st.sidebar.slider("ε (cluster_selection_epsilon)", 0.0, 1.0, 0.1)
-post_assign_threshold = st.sidebar.slider("Noise→Cluster sim threshold", 0.0, 1.0, 0.7)
-batch_size            = st.sidebar.number_input("Embedding batch size", 100, 5000, 500, 100)
-embed_bar             = st.sidebar.progress(0)
-embed_status          = st.sidebar.empty()
+# Helper: fetch query fan‑outs via Google Gemini
+def fetch_query_fan_outs(h1_text):
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+    payload = {"contents": [{"parts": [{"text": h1_text}]}], "tools": [{"google_search": {}}], "generationConfig": {"temperature": 1.0}}
+    try:
+        r = requests.post(endpoint, json=payload, timeout=30)
+        r.raise_for_status()
+        cand = r.json().get("candidates", [{}])[0]
+        return cand.get("groundingMetadata", {}).get("webSearchQueries", [])
+    except Exception as e:
+        st.warning(f"Fan‑out fetch failed: {e}")
+        return []
 
-# ── 6) Upload CSV ─────────────────────────────────────────────────────
-st.title("🔍 GSC‑to‑Topics Streamlit App")
-uploaded = st.file_uploader("Upload your GSC CSV", type="csv")
-if not uploaded:
-    st.info("Awaiting upload…")
-    st.stop()
+# Helper: build GPT prompt for JSON output
+def build_prompt(h1, headings, queries):
+    lines = ["I’m auditing this page for content gaps.", f"Main topic (H1): {h1}", "", "1) Existing headings (in order):"]
+    lines += [f"{lvl}: {txt}" for lvl, txt in headings]
+    lines += ["", "2) User queries to cover:"]
+    lines += [f"- {q}" for q in queries]
+    lines += ["", "3) Return a JSON array with keys: query, covered (true/false), explanation.", "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"]
+    return "\n".join(lines)
 
-# Read raw bytes to compute hash
-csv_bytes  = uploaded.getvalue()
-file_hash  = hashlib.sha256(csv_bytes).hexdigest()
-cache_pref = f"{file_hash}/"  # GCS folder for this file
+# Helper: call OpenAI and parse JSON
+def get_explanations(prompt):
+    resp = openai.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":prompt}], temperature=0.2)
+    txt = resp.choices[0].message.content.strip()
+    txt = re.sub(r"^```(?:json)?\s*", "", txt)
+    txt = re.sub(r"\s*```$", "", txt)
+    try:
+        arr = json.loads(txt)
+        return arr if isinstance(arr, list) else []
+    except:
+        return []
 
-# Parse into DataFrame
-df = pd.read_csv(io.BytesIO(csv_bytes))
-st.write("Data sample:", df.head())
+# Main: upload and process CSV
+df_file = st.file_uploader("Upload Screaming Frog CSV", type=["csv"])
+if df_file:
+    df = pd.read_csv(df_file)
+    urls = df['Address'].dropna().unique()
+    st.write(f"Found {len(urls)} URLs to process.")
 
-# ── 7) Clean & normalize ──────────────────────────────────────────────
-df = df.rename(columns={
-    "Query":       "query",
-    "Clicks":      "clicks",
-    "Impressions": "impressions",
-    "CTR":         "ctr",
-    "Position":    "avg_pos"
-})
-df["ctr"] = (
-    df["ctr"].astype(str)
-           .str.rstrip("%")
-           .pipe(pd.to_numeric, errors="coerce")
-           .fillna(0)
-)
-for col in ["clicks", "impressions", "avg_pos"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    # Detailed output rows and summary
+    detailed = []
+    summary = []
 
-# ── 8) Batch‑embed with durable GCS resume ─────────────────────────────
-queries  = df["query"].astype(str).tolist()
-total    = len(queries)
-all_embs = []
+    for url in urls:
+        st.write(f"Processing: {url}")
+        h1, headings = extract_h1_and_headings(url)
+        queries = fetch_query_fan_outs(h1)
+        if not queries:
+            continue
+        prompt = build_prompt(h1, headings, queries)
+        results = get_explanations(prompt)
 
-for i in range(0, total, batch_size):
-    start, end = i, min(i + batch_size, total)
-    embed_status.text(f"Batch {start+1}–{end} of {total}")
+        covered_count = sum(1 for it in results if it.get("covered"))
+        total = len(results)
+        pct = round((covered_count/total)*100) if total>0 else 0
+        summary.append({"Address": url, "Coverage (%)": pct})
 
-    saved = load_saved_batch(cache_pref, i)
-    if saved is not None:
-        batch_embs = saved
-    else:
-        batch_embs = embed_batch_local(tuple(queries[start:end]))
-        save_batch(cache_pref, i, batch_embs)
+        row = {"Address": url, "H1-1": h1, "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)}
+        for i, it in enumerate(results):
+            row[f"Query {i+1}"] = it.get("query", "")
+            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
+            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+        detailed.append(row)
 
-    all_embs.extend(batch_embs)
-    embed_bar.progress(end / total)
+    # Show and download detailed CSV
+    df_det = pd.DataFrame(detailed)
+    st.download_button("Download Detailed CSV", df_det.to_csv(index=False).encode('utf-8'), 'detailed.csv', 'text/csv')
+    st.dataframe(df_det)
 
-embeddings = np.array(all_embs)
-embed_bar.empty()
-embed_status.empty()
-st.success("✅ Embeddings complete (GCS‑backed)")
+    # Show and download summary CSV
+    df_sum = pd.DataFrame(summary)
+    st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv', 'text/csv')
+    st.dataframe(df_sum)
 
-# ── 9) PCA reduction ─────────────────────────────────────────────────
-with st.spinner("Running PCA…"):
-    coords = PCA(n_components=20, random_state=42).fit_transform(embeddings)
-st.success("✅ PCA complete")
-
-# ─ 10) HDBSCAN clustering ─────────────────────────────────────────────
-with st.spinner("Clustering…"):
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_eps,
-        metric="euclidean"
-    )
-    df["cluster"] = clusterer.fit_predict(coords)
-n_clusters = len(set(df["cluster"])) - (1 if -1 in df["cluster"] else 0)
-n_noise    = int((df["cluster"] == -1).sum())
-st.success(f"✅ Found {n_clusters} clusters (+{n_noise} noise)")
-
-# ─ 11) Reassign noise via cosine similarity ───────────────────────────
-with st.spinner("Re‑assigning noise…"):
-    centroids = {
-        cid: coords[idxs].mean(axis=0)
-        for cid, idxs in df[df.cluster != -1].groupby("cluster").indices.items()
-    }
-    def reassign(i: int) -> int:
-        if df.at[i, "cluster"] != -1:
-            return df.at[i, "cluster"]
-        vec  = coords[i].reshape(1, -1)
-        sims = {cid: cosine_similarity(vec, centroids[cid].reshape(1, -1))[0][0]
-                for cid in centroids}
-        best, score = max(sims.items(), key=lambda x: x[1])
-        return best if score >= post_assign_threshold else -1
-    df["cluster"] = [reassign(i) for i in df.index]
-st.success("✅ Noise re‑assigned")
-
-# ─ 12) GPT‑label clusters ─────────────────────────────────────────────
-cluster_ids = sorted(df["cluster"].unique())
-label_bar   = st.progress(0)
-labels_map  = {}
-for idx, cid in enumerate(cluster_ids):
-    if cid == -1:
-        labels_map[cid] = "Noise"
-    else:
-        with st.spinner(f"Labeling cluster {cid}…"):
-            sample = df[df.cluster == cid]["query"].tolist()[:10]
-            prompt = "Here are some queries:\n" + "\n".join(f"- {q}" for q in sample)
-            prompt += "\n\nProvide a concise topic name (3 words max):"
-            resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=20
-            )
-            labels_map[cid] = resp.choices[0].message.content.strip()
-    label_bar.progress((idx + 1) / len(cluster_ids))
-df["topic"] = df["cluster"].map(lambda c: labels_map.get(c, "Noise"))
-label_bar.empty()
-st.success("✅ Topics labeled")
-
-# ─ 13) Super‑cluster & label ─────────────────────────────────────────
-with st.spinner("Super‑clustering…"):
-    topic_texts = [t for t in df["topic"].unique() if t != "Noise"]
-    topic_embs  = []
-    for t in topic_texts:
-        resp = genai_client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=t,
-            config=EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=3072
-            )
-        )
-        topic_embs.append(resp.embeddings[0].values)
-
-    num_topics = len(topic_embs)
-    n_comp     = min(5, num_topics - 1) if num_topics > 1 else 1
-    tcoords    = PCA(n_components=n_comp, random_state=42).fit_transform(topic_embs)
-
-    super_clust = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric="euclidean")
-    super_ids   = super_clust.fit_predict(tcoords)
-    super_map   = dict(zip(topic_texts, super_ids))
-    df["super_id"] = df["topic"].map(lambda t: super_map.get(t, -1))
-
-super_ids    = sorted(df["super_id"].unique())
-super_bar    = st.progress(0)
-super_labels = {}
-for idx, sid in enumerate(super_ids):
-    if sid == -1:
-        super_labels[sid] = "Misc"
-    else:
-        with st.spinner(f"Labeling super‑cluster {sid}…"):
-            members = [t for t,s in super_map.items() if s == sid][:10]
-            prompt  = "Here are some topics:\n" + "\n".join(f"- {m}" for m in members)
-            prompt += "\n\nProvide a broad category name (1‑2 words):"
-            resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=10
-            )
-            super_labels[sid] = resp.choices[0].message.content.strip()
-    super_bar.progress((idx + 1) / len(super_ids))
-df["super_topic"] = df["super_id"].map(lambda x: super_labels.get(x, "Misc"))
-super_bar.empty()
-st.success("✅ Super‑topics labeled")
-
-# ─ 14) Display & download ─────────────────────────────────────────────
-st.write("Final sample:", df[["query","topic","super_topic","clicks","impressions","ctr","avg_pos"]].head())
-csv_data = df[["query","topic","super_topic","clicks","impressions","ctr","avg_pos"]].to_csv(index=False)
-st.download_button("⬇️ Download CSV", csv_data, "keywords_with_topics.csv", "text/csv")
 
 
 
