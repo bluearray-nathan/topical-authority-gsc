@@ -86,6 +86,53 @@ df_file = st.file_uploader("Upload Screaming Frog CSV", type=["csv"])
 if df_file:
     df = pd.read_csv(df_file)
     urls = df['Address'].dropna().unique()
+    total = len(urls)
+    st.write(f"Found {total} URLs to process.")
+    # Initialize progress bar and timer
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    start_time = time.time()
+
+    # Detailed output rows and summary
+    detailed = []
+    summary = []
+
+    for idx, url in enumerate(urls):
+        # Update progress and ETA
+        elapsed = time.time() - start_time
+        avg_time = elapsed / (idx + 1)
+        remaining = total - (idx + 1)
+        eta = int(remaining * avg_time)
+        progress = int((idx + 1) / total * 100)
+        progress_bar.progress(progress)
+        status_text.text(f"Processing {idx+1}/{total}. ETA: {eta}s")
+
+        # Process URL
+        st.write(f"Processing: {url}")
+        h1, headings = extract_h1_and_headings(url)
+        queries = fetch_query_fan_outs(h1)
+        if not queries:
+            continue
+        prompt = build_prompt(h1, headings, queries)
+        results = get_explanations(prompt)
+
+        covered_count = sum(1 for it in results if it.get("covered"))
+        total_q = len(results)
+        pct = round((covered_count/total_q)*100) if total_q>0 else 0
+        summary.append({"Address": url, "Coverage (%)": pct})
+
+        row = {"Address": url, "H1-1": h1, "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)}
+        for i, it in enumerate(results):
+            row[f"Query {i+1}"] = it.get("query", "")
+            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
+            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+        detailed.append(row)
+
+    # Finalize progress
+    progress_bar.progress(100)
+    status_text.text("Complete!")
+    df = pd.read_csv(df_file)
+    urls = df['Address'].dropna().unique()
     st.write(f"Found {len(urls)} URLs to process.")
 
     # Detailed output rows and summary
@@ -122,6 +169,7 @@ if df_file:
     df_sum = pd.DataFrame(summary)
     st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv', 'text/csv')
     st.dataframe(df_sum)
+
 
 
 
