@@ -128,47 +128,30 @@ if df_file:
             row[f"Query {i+1} Explanation"] = it.get("explanation", "")
         detailed.append(row)
 
-    # Finalize progress
+        # Finalize progress
     progress_bar.progress(100)
     status_text.text("Complete!")
-    df = pd.read_csv(df_file)
-    urls = df['Address'].dropna().unique()
-    st.write(f"Found {len(urls)} URLs to process.")
-
-    # Detailed output rows and summary
-    detailed = []
-    summary = []
-
-    for url in urls:
-        st.write(f"Processing: {url}")
-        h1, headings = extract_h1_and_headings(url)
-        queries = fetch_query_fan_outs(h1)
-        if not queries:
-            continue
-        prompt = build_prompt(h1, headings, queries)
-        results = get_explanations(prompt)
-
-        covered_count = sum(1 for it in results if it.get("covered"))
-        total = len(results)
-        pct = round((covered_count/total)*100) if total>0 else 0
-        summary.append({"Address": url, "Coverage (%)": pct})
-
-        row = {"Address": url, "H1-1": h1, "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)}
-        for i, it in enumerate(results):
-            row[f"Query {i+1}"] = it.get("query", "")
-            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
-            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
-        detailed.append(row)
 
     # Show and download detailed CSV
     df_det = pd.DataFrame(detailed)
-    st.download_button("Download Detailed CSV", df_det.to_csv(index=False).encode('utf-8'), 'detailed.csv', 'text/csv')
+    st.download_button(
+        "Download Detailed CSV",
+        df_det.to_csv(index=False).encode('utf-8'),
+        'detailed.csv',
+        'text/csv'
+    )
     st.dataframe(df_det)
 
     # Show and download summary CSV
     df_sum = pd.DataFrame(summary)
-    st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv', 'text/csv')
+    st.download_button(
+        "Download Summary CSV",
+        df_sum.to_csv(index=False).encode('utf-8'),
+        'summary.csv',
+        'text/csv'
+    )
     st.dataframe(df_sum)
+
 
 
 
