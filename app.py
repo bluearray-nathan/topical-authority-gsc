@@ -1,12 +1,20 @@
 # app.py
+# LLM IA (clusters-only) → builds a taxonomy (hubs) from your clusters,
+# then assigns each cluster to the best hub. Preserves exact CSV headers/order
+# and overwrites only the values in "Topical cluster".
+#
+# Requirements:
+# - Streamlit secrets configured for Vertex + OpenAI (same as your prior app)
+# - CSV must contain: Keyword, Search volume, Cluster, Topical cluster (others preserved)
 
 import os
 import io
 import json
 import time
+import math
 import hashlib
-from typing import Dict, List, Tuple
-from collections import defaultdict
+from typing import Dict, List, Tuple, Any
+from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
@@ -14,8 +22,7 @@ import pandas as pd
 import numpy as np
 
 from sklearn.preprocessing import normalize
-from sklearn.decomposition import PCA
-import hdbscan
+from sklearn.metrics.pairwise import cosine_similarity
 
 from openai import OpenAI
 from google.cloud import aiplatform
@@ -23,11 +30,11 @@ from google import genai
 from google.genai.types import EmbedContentConfig
 
 # ──────────────────────────────────────────────────────────────────────
-# Page
+# Page config
 # ──────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Arden Topical Clusters (Hubs)", page_icon="🧭", layout="wide")
-st.title("🧭 Build Topical Clusters (Content Hubs) for Arden-like CSVs")
-st.caption("Only the values in 'Cluster' and 'Topical cluster' are changed. All other headers & order are preserved.")
+st.set_page_config(page_title="Topical Hubs (LLM IA, clusters-only)", page_icon="🧭", layout="wide")
+st.title("🧭 Build Topical Hubs (LLM IA, clusters-only)")
+st.caption("Generates a clean hub taxonomy from your clusters and assigns each cluster. Only 'Topical cluster' values are changed; all other headers & order preserved.")
 
 # ──────────────────────────────────────────────────────────────────────
 # Credentials (same pattern as before)
@@ -43,8 +50,7 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/sa.json"
 os.environ["GOOGLE_CLOUD_PROJECT"]          = vertex_secret["project_id"]
 os.environ["GOOGLE_CLOUD_LOCATION"]         = region
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"]     = "True"
-
-os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
+os.environ["OPENAI_API_KEY"]                = st.secrets["openai"]["api_key"]
 
 aiplatform.init(project=vertex_secret["project_id"], location=region)
 genai_client  = genai.Client()
@@ -55,53 +61,57 @@ openai_client = OpenAI()
 # ──────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 Settings")
 
+# How many clusters to sample to design the taxonomy (the hub list)
+sample_top_n = st.sidebar.slider("Clusters used to design taxonomy (by volume)", 300, 2000, 1000, 50,
+                                 help="A good hub set emerges from ~800–1500 high-signal clusters.")
+
+# Strictness via confidence thresholds for assignment
 strictness = st.sidebar.radio(
-    "Grouping strictness (HDBSCAN)",
-    options=["Soft", "Medium", "Hard"],
-    index=1,
-    help="Soft = broader hubs; Hard = tighter, more specific hubs."
+    "Assignment strictness",
+    options=["Soft", "Medium", "Hard"], index=1,
+    help="Higher strictness demands stronger matches; fewer forced assignments."
 )
 
-# Tuned presets: smaller min_cluster_size + epsilon helps avoid mega-buckets
-HDBSCAN_PRESETS = {
-    "Soft":   {"min_cluster_size": 6,  "min_samples": 1, "epsilon": 0.10},
-    "Medium": {"min_cluster_size": 10, "min_samples": 2, "epsilon": 0.06},
-    "Hard":   {"min_cluster_size": 16, "min_samples": 4, "epsilon": 0.03},
-}
-preset = HDBSCAN_PRESETS[strictness]
+CONF_THRESH = {"Soft": 0.45, "Medium": 0.60, "Hard": 0.72}
+SIM_FLOOR   = {"Soft": 0.78, "Medium": 0.82, "Hard": 0.86}  # embedding sanity check floor
+conf_floor  = CONF_THRESH[strictness]
+sim_floor   = SIM_FLOOR[strictness]
 
-# After HDBSCAN, merge clusters only if their centroids are very similar
-CENTROID_MERGE_THRESH = {"Soft": 0.86, "Medium": 0.89, "Hard": 0.92}
-merge_tau = CENTROID_MERGE_THRESH[strictness]
+# Parallelism & retries
+max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48, 1)
+rate_limit_delay   = st.sidebar.slider("Base backoff on 429/5xx (seconds)", 0.5, 10.0, 2.0, 0.5)
+temperature        = st.sidebar.slider("GPT temperature (naming/IA)", 0.0, 1.0, 0.2, 0.1)
 
-use_pca = st.sidebar.checkbox("Use PCA before HDBSCAN", value=False,
-                              help="Skipping PCA often preserves finer distinctions.")
-pca_components = st.sidebar.slider("PCA components (if used)", 5, 50, 25, 1)
+# Summary construction
+max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
 
-# Tokens that cause over-merging (downweight/remove in summaries). Keep geo terms.
+# Stop tokens (down-weight generic boilerplate; keep geo/level/mode if meaningful)
 stop_default = "a level,a-level,level,course,courses,degree,degrees,education,ai,guide,hub,near me,programme,program,study,studies,learn,learning,university,uni,college"
 stop_tokens = st.sidebar.text_area(
-    "Tokens to downweight/remove (comma-separated)",
-    value=stop_default,
-    height=80,
-    help="Common boilerplate tokens that cause over-merging. Geo tokens are kept."
+    "Tokens to downweight/remove in summaries (comma-separated)",
+    value=stop_default, height=80
 )
 
-max_keywords_for_summary = st.sidebar.slider("Keywords used in summary per cluster", 4, 20, 10, 1)
-max_keywords_for_naming  = st.sidebar.slider("Keywords sent to GPT for cluster naming", 5, 30, 12, 1)
-
-max_workers_topical_naming = st.sidebar.slider("Parallel GPT workers (topical naming)", 1, 64, 16, 1)
-temperature = st.sidebar.slider("GPT temperature (naming)", 0.0, 1.0, 0.2, 0.1)
-rate_limit_delay = st.sidebar.slider("Backoff base wait on 429/errors (sec)", 0.5, 10.0, 2.0, 0.5)
-
+# Keep exact headers & order, overwrite only Topical cluster
 keep_identical_headers = st.sidebar.checkbox(
-    "Keep output columns identical to input (overwrite only 'Cluster' and 'Topical cluster')",
+    "Keep output columns identical to input (overwrite only 'Topical cluster')",
     value=True
 )
 
+st.sidebar.markdown("---")
+st.sidebar.caption("Tip: Use a small dry run (e.g., sample_top_n=500) to validate the hub set, then run full assignment.")
+
 # ──────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers: hashing, caching, embeddings, prompts, retrying
 # ──────────────────────────────────────────────────────────────────────
+def file_hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+@st.cache_resource(show_spinner=False)
+def get_assignment_cache() -> Dict[str, Any]:
+    """In-memory cache for assignments: key (cluster summary hash) -> result dict."""
+    return {}
+
 @st.cache_data(show_spinner=False)
 def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
     """Embed texts via Vertex AI and cache locally."""
@@ -124,90 +134,18 @@ def clean_tokens(s: str, stops: set[str]) -> str:
     parts = [p for p in parts if p not in stops]
     return " ".join(parts)
 
-def union_find_merge(centroids: Dict[int, np.ndarray], tau: float) -> Dict[int, int]:
-    """Merge clusters whose centroid cosine similarity >= tau."""
-    from sklearn.preprocessing import normalize as sknorm
-    parent = {i: i for i in centroids}
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+def build_cluster_summary(name: str, kw_rows: pd.DataFrame, stops: set[str], top_k: int) -> str:
+    tmp = kw_rows.copy()
+    tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
+    kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
+    cleaned = [clean_tokens(k, stops) for k in kws]
+    cleaned = [c for c in cleaned if c]
+    if not cleaned:
+        return name
+    return f"{name} — " + ", ".join(cleaned)
 
-    ids = list(centroids.keys())
-    mats = np.vstack([centroids[i] for i in ids])
-    mats = sknorm(mats, axis=1)
-    sims = mats @ mats.T
-    n = sims.shape[0]
-    for i in range(n):
-        for j in range(i+1, n):
-            if sims[i, j] >= tau:
-                union(ids[i], ids[j])
-
-    for i in ids:
-        parent[i] = find(i)
-    return parent
-
-def build_cluster_naming_prompt(existing_name: str, bullets: str) -> str:
-    return f"""You are naming content hubs for a university website.
-
-Input: a cluster of closely related keywords (with volumes) about the same intent.
-Your job: produce a concise, human-readable hub name suitable for a site category or hub page.
-
-Rules:
-- 3–5 words, Title Case.
-- No brand names, brackets, pipes, or slashes.
-- Keep consistent geo or level (e.g., “UK”, “Online”, “Undergraduate”) only if intrinsic.
-- Avoid keyword-stuffing; no “near me” unless intrinsic.
-- Prefer natural-sounding names over exact-match keywords.
-- Do NOT just repeat the highest-volume keyword if it reads awkwardly.
-
-Existing label (may be messy): {existing_name}
-
-Keywords:
-{bullets}
-
-Return ONLY the name, nothing else.
-""".strip()
-
-def build_topical_name_prompt(member_cluster_names: List[str]) -> str:
-    bullets = "\n".join(f"- {n}" for n in member_cluster_names[:24])
-    banned = {"AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"}
-    examples = """
-Good Examples:
-- Undergraduate Business Degrees
-- Online Psychology Courses
-- MBA & Executive Management
-- Law & Criminology (UK)
-- Computing & IT Degrees
-
-Bad Examples (DO NOT USE):
-- AI Education Hub
-- A Level
-- Misc
-- Education
-- General
-""".strip()
-    return f"""Name a single higher-level SEO topic hub based on these cluster names.
-
-Cluster names:
-{bullets}
-
-Rules:
-- 2–4 words, Title Case.
-- Must be specific and navigational (good for a hub page).
-- Avoid generic or banned labels: {", ".join(sorted(banned))}.
-- Include geo/level (e.g., UK, Online, Undergraduate) only if common across members.
-- Return ONLY the name, nothing else.
-
-{examples}
-""".strip()
-
-def call_openai_name(prompt: str, temperature: float, max_tokens: int = 24) -> str:
+def call_openai(prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
+    """Robust OpenAI call with backoff; returns raw text."""
     attempt, wait = 0, rate_limit_delay
     while True:
         attempt += 1
@@ -218,222 +156,356 @@ def call_openai_name(prompt: str, temperature: float, max_tokens: int = 24) -> s
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            name = resp.choices[0].message.content.strip()
-            name = " ".join(name.split())
-            name = name.replace("|", "").replace("/", " ").strip()
-            return name
+            return (resp.choices[0].message.content or "").strip()
         except Exception:
             if attempt >= 6:
                 raise
             time.sleep(wait)
             wait *= 1.8
 
-def gpt_name_cluster(orig_name: str, rows: pd.DataFrame, top_k: int) -> str:
-    """Return a clean 3–5 word human-readable name for the given cluster using top-K keywords by Search volume."""
-    tmp = rows.copy()
-    if "Search volume" in tmp.columns:
-        tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
-        tmp = tmp.sort_values("__vol__", ascending=False)
-    kws = tmp["Keyword"].astype(str).tolist()[:top_k]
-    vols = tmp["__vol__"].tolist()[:top_k] if "__vol__" in tmp.columns else [None]*len(kws)
-    bullets = "\n".join(
-        f"- {k} ({int(v)})" if (v is not None) else f"- {k}"
-        for k, v in zip(kws, vols)
-    )
-    prompt = build_cluster_naming_prompt(orig_name, bullets)
-    name = call_openai_name(prompt, temperature=temperature, max_tokens=20) or (orig_name or "Unnamed Cluster")
-    return name
-
-def name_topical_groups(groups: Dict[int, List[str]]) -> Dict[int, str]:
-    """Name topical groups from member cluster names (parallel)."""
-    out = {}
-    with ThreadPoolExecutor(max_workers=max_workers_topical_naming) as ex:
-        futs = {}
-        for gid, members in groups.items():
-            if gid == -1:
-                out[gid] = "Misc"
-                continue
-            prompt = build_topical_name_prompt(members)
-            futs[ex.submit(call_openai_name, prompt, temperature, 16)] = gid
-
-        progress = st.progress(0.0)
-        done = 0
-        total = max(1, len(futs))
-        for fut in as_completed(futs):
-            gid = futs[fut]
+def call_openai_json(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -> Any:
+    """Ask for strict JSON and parse; fall back to naive JSON extraction."""
+    text = call_openai(prompt, max_tokens=max_tokens, temperature=temperature)
+    # Try direct JSON first
+    try:
+        return json.loads(text)
+    except Exception:
+        # Naive bracket extraction
+        start = text.find("{")
+        end   = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
             try:
-                nm = fut.result()
-                if nm.lower() in {"misc", "general", "education"} or len(nm) < 3:
-                    nm = groups.get(gid, ["Topic"])[0]
-            except Exception as e:
-                nm = groups.get(gid, ["Topic"])[0]
-                st.warning(f"Topical naming failed for group {gid}: {e}")
-            out[gid] = nm
-            done += 1
-            progress.progress(done/total)
-        progress.empty()
-    return out
+                return json.loads(text[start:end+1])
+            except Exception:
+                pass
+        # As last resort, try list JSON
+        start = text.find("["); end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except Exception:
+                pass
+        raise ValueError("Could not parse JSON from LLM response.")
 
 # ──────────────────────────────────────────────────────────────────────
-# Upload CSV (Arden-like schema)
+# Prompts
 # ──────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader("Upload your Arden CSV", type=["csv"])
+BANNED_LABELS = ["AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"]
+
+def taxonomy_prompt(sample_items: List[Dict[str, Any]], max_hubs: int = 100) -> str:
+    """
+    Ask GPT to design a taxonomy (hub list) purely from cluster summaries.
+    Each hub must have: id, title, accepts[], avoid[], optional parent_id.
+    """
+    examples = """
+Good hub titles (2–4 words):
+- Undergraduate Business Degrees
+- Online Psychology Courses
+- MBA & Executive Management
+- Law & Criminology (UK)
+- Computing & IT Degrees
+
+Forbidden titles (too generic):
+- AI Education Hub
+- A Level
+- Misc
+- Education
+- General
+""".strip()
+
+    return f"""
+Design a two-tier site taxonomy (list of hubs) **solely** from the following cluster summaries.
+Respond with strict JSON:
+{{
+  "hubs": [
+    {{
+      "id": "UG_BUSINESS",
+      "title": "Undergraduate Business Degrees",
+      "parent_id": null,
+      "accepts": ["business", "management", "ba", "bsc", "undergraduate"],
+      "avoid":   ["mba","postgraduate","fees"]
+    }}
+  ],
+  "constraints": {{"max_hubs": {max_hubs}, "max_depth": 2}}
+}}
+
+Rules:
+- 60–{max_hubs} hubs, 2–4 word **Title Case** names.
+- Avoid banned titles: {", ".join(BANNED_LABELS)}.
+- Keep consistent level/mode/geo **only if common** across items.
+- Favor hubs that align to user navigation; keep granularity consistent.
+- IDs must be uppercase snake-like (A–Z, 0–9, underscores), unique and stable.
+- Include short 'accepts' terms that characterize the hub; include 'avoid' for common confusions.
+- Keep depth at most 2 (parent/child). Parent hubs optional.
+
+Cluster summaries (sample):
+{json.dumps(sample_items, ensure_ascii=False, indent=2)}
+
+Return JSON only.
+""".strip()
+
+def assign_prompt(cluster_name: str, summary: str, hubs_json: Dict[str, Any], strictness: str) -> str:
+    """
+    Ask GPT to assign this cluster to best hub: return JSON:
+    {"best":"HUB_ID","confidence":0.0,"alts":[["ALT_ID",0.0],...]}
+    """
+    return f"""
+You assign content clusters to site hubs.
+
+Strictness: {strictness}. Choose the best hub for the cluster below.
+Return strictly this JSON:
+{{"best":"HUB_ID","confidence":0.00,"alts":[["ALT_ID",0.00],["ALT2_ID",0.00]]}}
+
+Rules:
+- Prefer hubs whose 'accepts' fit and 'avoid' do not match.
+- Keep level/mode/geo if present in the cluster summary.
+- Be conservative: if uncertain, lower confidence.
+- No commentary.
+
+Hubs JSON:
+{json.dumps(hubs_json, ensure_ascii=False)}
+
+Cluster:
+- name: {cluster_name}
+- summary: {summary}
+""".strip()
+
+# ──────────────────────────────────────────────────────────────────────
+# Upload CSV
+# ──────────────────────────────────────────────────────────────────────
+uploaded = st.file_uploader("Upload your CSV (must include: Keyword, Search volume, Cluster, Topical cluster)", type=["csv"])
 if not uploaded:
-    st.info("Awaiting CSV… Must include at least: Keyword, Search volume, Cluster, Topical cluster.")
+    st.info("Awaiting CSV…")
     st.stop()
 
 csv_bytes = uploaded.getvalue()
 df = pd.read_csv(io.BytesIO(csv_bytes))
-st.subheader("Preview")
-st.dataframe(df.head(20), use_container_width=True)
+original_columns = list(df.columns)
 
-required_cols = ["Keyword", "Search volume", "Cluster", "Topical cluster"]
-missing = [c for c in required_cols if c not in df.columns]
+required = ["Keyword", "Search volume", "Cluster", "Topical cluster"]
+missing = [c for c in required if c not in df.columns]
 if missing:
     st.error(f"Missing required column(s): {', '.join(missing)}")
     st.stop()
 
-original_columns = list(df.columns)  # preserve exact order
-st.write(f"Rows: {len(df):,}  |  Columns: {len(df.columns)}")
+st.subheader("Preview")
+st.dataframe(df.head(20), use_container_width=True)
+st.write(f"Rows: {len(df):,} | Unique clusters: {df['Cluster'].nunique():,}")
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 1 — Rename each Cluster with GPT (using member keywords & volumes)
+# Prepare per-cluster summaries (by Search volume)
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 1 — Renaming clusters with GPT")
+st.subheader("Step 1 — Preparing cluster summaries")
+stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
+
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
+
+cluster_summaries: Dict[str, str] = {}
+cluster_total_vol: Dict[str, float] = {}
+
+for cname, grp in cluster_groups.items():
+    summary = build_cluster_summary(str(cname), grp, stops, max_keywords_for_summary)
+    cluster_summaries[str(cname)] = summary
+    vol = pd.to_numeric(grp["Search volume"], errors="coerce").fillna(0).sum()
+    cluster_total_vol[str(cname)] = float(vol)
+
+# ──────────────────────────────────────────────────────────────────────
+# Build taxonomy from a sample of top clusters (by total volume)
+# ──────────────────────────────────────────────────────────────────────
+st.subheader("Step 2 — Designing the taxonomy (hubs) from clusters")
+# Select top-N clusters by total volume
+sorted_clusters = sorted(cluster_total_vol.items(), key=lambda x: x[1], reverse=True)
+sample = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(v)}
+          for c, v in sorted_clusters[:sample_top_n]]
+
+# Ask GPT for taxonomy JSON (cached by file hash + sample size)
+@st.cache_data(show_spinner=False)
+def get_taxonomy(file_sig: str, sample_json: str, max_hubs: int) -> Dict[str, Any]:
+    prompt = taxonomy_prompt(json.loads(sample_json), max_hubs=max_hubs)
+    ia = call_openai_json(prompt, max_tokens=2000, temperature=temperature)
+    # Basic validation
+    hubs = ia.get("hubs", [])
+    # Ensure required fields & uniqueness
+    seen_ids, seen_titles = set(), set()
+    cleaned_hubs = []
+    for h in hubs:
+        hid = str(h.get("id", "")).upper().replace(" ", "_")
+        title = str(h.get("title", "")).strip()
+        if not hid or not title:
+            continue
+        if hid in seen_ids or title.lower() in seen_titles:
+            continue
+        seen_ids.add(hid); seen_titles.add(title.lower())
+        cleaned_hubs.append({
+            "id": hid,
+            "title": title,
+            "parent_id": h.get("parent_id", None),
+            "accepts": h.get("accepts", [])[:20],
+            "avoid": h.get("avoid", [])[:20]
+        })
+    return {"hubs": cleaned_hubs, "constraints": ia.get("constraints", {"max_hubs": max_hubs, "max_depth": 2})}
+
+file_sig = file_hash_bytes(csv_bytes) + f"|sample={sample_top_n}"
+ia = get_taxonomy(file_sig, json.dumps(sample, ensure_ascii=False), max_hubs=100)
+
+# Allow user to edit the taxonomy JSON if desired
+st.caption("Review/edit the generated taxonomy (optional).")
+ia_text = st.text_area("Taxonomy JSON", json.dumps(ia, ensure_ascii=False, indent=2), height=320)
+try:
+    ia = json.loads(ia_text)
+    hubs_list: List[Dict[str, Any]] = ia.get("hubs", [])
+except Exception as e:
+    st.error(f"Invalid JSON in taxonomy editor: {e}")
+    st.stop()
+
+if not hubs_list:
+    st.error("No hubs were generated.")
+    st.stop()
+
+# Build maps for hub metadata
+hub_id_to_title = {h["id"]: h["title"] for h in hubs_list}
+hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
+
+# Build hub summaries for embedding sanity checks: title + accepts
+hub_summaries = [f'{h["title"]} — ' + ", ".join([t for t in h.get("accepts", []) if isinstance(t, str)]) for h in hubs_list]
+hub_ids_ordered = [h["id"] for h in hubs_list]
+hub_titles_ordered = [h["title"] for h in hubs_list]
+
+# Pre-embed hubs (once)
+st.caption("Embedding hub summaries for assignment sanity checks…")
+hub_vecs = embed_texts_cached(tuple(hub_summaries))
+hub_vecs = normalize(hub_vecs, axis=1)
+
+# ──────────────────────────────────────────────────────────────────────
+# Assign each cluster to best hub (parallel, cached, with embedding check)
+# ──────────────────────────────────────────────────────────────────────
+st.subheader("Step 3 — Assigning clusters to hubs")
+
+assign_cache = get_assignment_cache()
+
+def assignment_key(cluster_name: str, summary: str) -> str:
+    return hashlib.sha256((cluster_name + "||" + summary).encode("utf-8")).hexdigest()
+
+def embed_cluster_summary(summary: str) -> np.ndarray:
+    v = embed_texts_cached((summary,))[0]
+    v = v.reshape(1, -1)
+    v = normalize(v, axis=1)
+    return v
+
+def choose_with_similarity_guard(cluster_vec: np.ndarray, best_id: str, alt_ids: List[str]) -> str:
+    # Compute cosine sims against hubs for best and alts; if best < floor but an alt passes, switch.
+    try:
+        idx_best = hub_ids_ordered.index(best_id)
+    except ValueError:
+        idx_best = None
+    sims = []
+    if idx_best is not None:
+        sims.append((best_id, float((cluster_vec @ hub_vecs[idx_best].reshape(-1,1)).ravel()[0])))
+    for aid in alt_ids[:3]:
+        try:
+            j = hub_ids_ordered.index(aid)
+            sims.append((aid, float((cluster_vec @ hub_vecs[j].reshape(-1,1)).ravel()[0])))
+        except ValueError:
+            continue
+    # Pick first with sim >= floor; else keep best_id
+    for hid, sim in sorted(sims, key=lambda x: (x[0] != best_id, -x[1])):  # check best first
+        if sim >= sim_floor:
+            return hid
+    return best_id
+
+def fallback_parent(hid: str) -> str:
+    # Climb to parent if exists; else keep original
+    p = hub_id_to_parent.get(hid)
+    return p if p else hid
+
+def assign_one(cluster_name: str, summary: str) -> Dict[str, Any]:
+    key = assignment_key(cluster_name, summary)
+    if key in assign_cache:
+        return assign_cache[key]
+    prompt = assign_prompt(cluster_name, summary, {"hubs": hubs_list}, strictness)
+    result = call_openai_json(prompt, max_tokens=300, temperature=temperature)
+    # Basic shape enforcement
+    best = result.get("best", "")
+    confidence = float(result.get("confidence", 0.0) or 0.0)
+    alts = result.get("alts", [])
+    alt_ids = [a[0] for a in alts if isinstance(a, list) and a and isinstance(a[0], str)]
+    # Embedding sanity check
+    cvec = embed_cluster_summary(summary)
+    chosen = best
+    if confidence < conf_floor:
+        # Try parent fallback
+        chosen = fallback_parent(best)
+    # Similarity guard (if still low semantic similarity, try an alt that passes)
+    chosen = choose_with_similarity_guard(cvec, chosen, alt_ids)
+    out = {"best": best, "chosen": chosen, "confidence": confidence, "alts": alts}
+    assign_cache[key] = out
+    return out
+
+# Build per-cluster summary list
+cluster_names = list(cluster_summaries.keys())
+cluster_summary_list = [cluster_summaries[c] for c in cluster_names]
+
+# Parallel assignment
+assigned_map: Dict[str, str] = {}
 progress = st.progress(0.0)
 status   = st.empty()
 
-renamed_map: Dict[str, str] = {}
-total = len(cluster_groups)
-for i, (orig_name, grp) in enumerate(cluster_groups.items(), start=1):
-    status.text(f"Renaming cluster {i}/{total}: {orig_name if isinstance(orig_name, str) else '(blank)'}")
+def worker(args):
+    cname, summary = args
     try:
-        new_name = gpt_name_cluster(str(orig_name), grp, max_keywords_for_naming)
+        res = assign_one(cname, summary)
+        hid = res.get("chosen") or res.get("best")
+        title = hub_id_to_title.get(hid, hub_id_to_title.get(res.get("best", ""), "Misc"))
+        return cname, title, res
     except Exception as e:
-        new_name = str(orig_name) if pd.notna(orig_name) else "Unnamed Cluster"
-        st.warning(f"Naming failed for '{orig_name}': {e}. Kept original.")
-    renamed_map[orig_name] = new_name
-    progress.progress(i / total)
+        return cname, "Misc", {"error": str(e)}
+
+tasks = list(zip(cluster_names, cluster_summary_list))
+done = 0
+results_log = []
+
+with ThreadPoolExecutor(max_workers=max_workers_assign) as ex:
+    for cname, title, res in ex.map(worker, tasks):
+        assigned_map[cname] = title
+        results_log.append((cname, res))
+        done += 1
+        if done % 50 == 0 or done == len(tasks):
+            status.text(f"Assigned {done}/{len(tasks)} clusters")
+            progress.progress(done / len(tasks))
 
 progress.empty()
 status.empty()
-df["Cluster"] = df["Cluster"].map(lambda x: renamed_map.get(x, x))
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 2 — Build summaries & embed (one vector per *renamed* cluster)
-# Summaries use top member keywords (by volume) from this dataset.
+# Apply to DataFrame & download
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 2 — Embedding cluster summaries for topical grouping")
+st.subheader("Step 4 — Write results (identical headers)")
+df_out = df.copy()
+df_out["Topical cluster"] = df_out["Cluster"].astype(str).map(lambda c: assigned_map.get(c, "Misc"))
 
-# Re-group by the new Cluster names
-renamed_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
-
-stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
-
-def build_summary_for_group(name: str, grp: pd.DataFrame, top_k: int) -> str:
-    tmp = grp.copy()
-    tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
-    kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
-    # clean tokens
-    cleaned = []
-    for k in kws:
-        cleaned.append(clean_tokens(k, stops))
-    cleaned = [c for c in cleaned if c]
-    if not cleaned:
-        return name
-    return f"{name} — " + ", ".join(cleaned)
-
-names = list(renamed_groups.keys())
-summaries = [build_summary_for_group(n, renamed_groups[n], max_keywords_for_summary) for n in names]
-
-emb_bar = st.progress(0.0)
-embeddings = []
-B = 128
-for i in range(0, len(summaries), B):
-    batch = summaries[i:i+B]
-    arr = embed_texts_cached(tuple(batch))
-    embeddings.append(arr)
-    emb_bar.progress(min(1.0, (i+B)/max(1, len(summaries))))
-emb_bar.empty()
-X = np.vstack(embeddings).astype(np.float32)
-
-# ──────────────────────────────────────────────────────────────────────
-# Step 3 — HDBSCAN topical grouping (+ centroid merge)
-# ──────────────────────────────────────────────────────────────────────
-st.subheader(f"Step 3 — Topical grouping with HDBSCAN ({strictness})")
-Xn = normalize(X, norm="l2", axis=1)
-Xp = Xn
-if use_pca and Xn.shape[0] > pca_components:
-    n_comp = min(pca_components, Xn.shape[0]-1)
-    Xp = PCA(n_components=max(2, n_comp), random_state=42).fit_transform(Xn)
-
-clusterer = hdbscan.HDBSCAN(
-    min_cluster_size=preset["min_cluster_size"],
-    min_samples=preset["min_samples"],
-    metric="euclidean",
-    cluster_selection_epsilon=preset["epsilon"],
-    cluster_selection_method="eom"
-)
-labels = clusterer.fit_predict(Xp)
-
-# Collect members per topical label
-label_to_names: Dict[int, List[str]] = defaultdict(list)
-for nm, lab in zip(names, labels):
-    label_to_names[int(lab)].append(nm)
-
-# Centroid-based merge to prevent accidental mega-buckets
-st.caption("Applying centroid merge to prevent over-broad buckets…")
-centroids: Dict[int, np.ndarray] = {}
-for lab, member_names in label_to_names.items():
-    idxs = [names.index(nm) for nm in member_names]
-    if idxs:
-        centroids[lab] = Xn[idxs].mean(axis=0)
-if len(centroids) > 1:
-    parent_map = union_find_merge(centroids, merge_tau)
-    merged_label_to_names: Dict[int, List[str]] = defaultdict(list)
-    for lab, member_names in label_to_names.items():
-        root = parent_map.get(lab, lab)
-        merged_label_to_names[root].extend(member_names)
-    # dedupe members per merged group
-    label_to_names = {k: sorted(set(v)) for k, v in merged_label_to_names.items()}
-
-# ──────────────────────────────────────────────────────────────────────
-# Step 4 — Name topical clusters (from member cluster names only)
-# ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 4 — Naming topical clusters")
-topical_name_map = name_topical_groups(label_to_names)
-
-# Build Cluster -> Topical cluster mapping
-cluster_to_topical: Dict[str, str] = {}
-for gid, member_names in label_to_names.items():
-    tname = topical_name_map.get(gid, "Misc")
-    for c in member_names:
-        cluster_to_topical[c] = tname
-
-# Apply back to DataFrame, preserving exact headers & order
-st.subheader("Result & Download")
-df["Topical cluster"] = df["Cluster"].map(lambda c: cluster_to_topical.get(str(c), "Misc"))
-
-# Ensure column order exactly as input
-df_out = df[original_columns]
+# Preserve exact column order
+df_out = df_out[original_columns]
 csv_out = df_out.to_csv(index=False)
+
 st.download_button(
     "⬇️ Download updated CSV (identical headers)",
     data=csv_out,
-    file_name="arden_topical_clusters_updated.csv",
+    file_name="topical_hubs_llm_clusters_only.csv",
     mime="text/csv"
 )
+st.success("✅ Done. Only 'Topical cluster' values were updated; headers/order unchanged.")
 
-# Quick distribution preview
+# ──────────────────────────────────────────────────────────────────────
+# Diagnostics
+# ──────────────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Topical distribution (preview)")
-preview = (
-    pd.Series([cluster_to_topical.get(c, "Misc") for c in names])
-      .value_counts().head(25).reset_index()
-)
-preview.columns = ["Topical cluster", "Clusters"]
-st.dataframe(preview, use_container_width=True)
+st.subheader("Hub distribution (top 25)")
+dist = pd.Series([assigned_map.get(c, "Misc") for c in cluster_names]).value_counts().head(25).reset_index()
+dist.columns = ["Topical cluster", "Clusters"]
+st.dataframe(dist, use_container_width=True)
+
+st.caption("Tip: If a hub looks too large or too generic, edit the taxonomy JSON above (e.g., split it or refine 'accepts/avoid') and re-run the assignment.")
+
 
 
 
