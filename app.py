@@ -1,4 +1,4 @@
-# app.py — Simple, fast hubming via embeddings + k-NN graph communities
+# app.py — Simple, fast hubbing via embeddings + k-NN graph communities
 # - No map-reduce prompts, no JSON consolidation.
 # - Uses Vertex embeddings for clusters; k-NN graph + similarity threshold → communities.
 # - (Optional) GPT only to NAME hubs (small, parallel calls).
@@ -17,7 +17,7 @@ import json
 import time
 import hashlib
 from typing import Dict, List, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,7 @@ import numpy as np
 
 from sklearn.preprocessing import normalize
 from sklearn.neighbors import NearestNeighbors
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from openai import OpenAI
@@ -68,7 +68,6 @@ st.sidebar.header("🔧 Settings")
 # Strictness ↔ similarity threshold
 strictness = st.sidebar.radio("Clustering strictness", ["Soft", "Medium", "Hard"], index=1,
                               help="Higher threshold = tighter (more) hubs.")
-# Good starting points for Vertex text embeddings
 SIM_THRESH = {"Soft": 0.40, "Medium": 0.46, "Hard": 0.53}
 sim_threshold = st.sidebar.slider("Similarity threshold", 0.30, 0.70, SIM_THRESH[strictness], 0.01)
 
@@ -81,6 +80,7 @@ max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summa
 stop_default = "guide,hub,near me"
 stop_tokens = st.sidebar.text_area("Downweight/remove tokens in summaries (comma-separated)",
                                    value=stop_default, height=70)
+embed_batch_size = st.sidebar.slider("Embedding batch size", 64, 1000, 256, 32)
 
 # GPT naming
 use_gpt_names   = st.sidebar.checkbox("Use GPT to name hubs", value=True)
@@ -120,7 +120,7 @@ def build_cluster_summary(name: str, kw_rows: pd.DataFrame, stops: set[str], top
 
 @st.cache_data(show_spinner=False)
 def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
-    """Vertex embeddings with local cache."""
+    """Vertex embeddings with local cache (embeds each text individually)."""
     embs = []
     for txt in texts:
         resp = genai_client.models.embed_content(
@@ -133,6 +133,23 @@ def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
         )
         embs.append(resp.embeddings[0].values)
     return np.array(embs, dtype=np.float32)
+
+def embed_in_batches(texts: List[str], batch_size: int = 256) -> np.ndarray:
+    """Embed in batches with a visible progress bar; uses cached per-batch calls."""
+    total = len(texts)
+    if total == 0:
+        return np.zeros((0, 3072), dtype=np.float32)
+    bar = st.progress(0.0)
+    chunks = []
+    done = 0
+    for i in range(0, total, batch_size):
+        batch = texts[i:i + batch_size]
+        embs = embed_texts_cached(tuple(batch))  # cached across runs
+        chunks.append(embs)
+        done += len(batch)
+        bar.progress(done / total)
+    bar.empty()
+    return normalize(np.vstack(chunks), axis=1)
 
 def call_openai_json(prompt: str, max_tokens: int = 200, temperature: float = 0.0, retries: int = 4) -> Any:
     """Strict JSON with retries/repair."""
@@ -168,12 +185,13 @@ def call_openai_json(prompt: str, max_tokens: int = 200, temperature: float = 0.
         fixed = _ask(f"Fix to valid JSON. Only JSON.\n\n{raw}", True)
         return json.loads(fixed)
     except Exception:
-        # Fallback: largest JSON block
         for ob, cb in [("{","}"), ("[","]")]:
             s, e = raw.find(ob), raw.rfind(cb)
             if s != -1 and e != -1 and e > s:
-                try: return json.loads(raw[s:e+1])
-                except Exception: pass
+                try:
+                    return json.loads(raw[s:e+1])
+                except Exception:
+                    pass
         raise ValueError("Could not parse JSON from LLM response.")
 
 # ──────────────────────────────────────────────────────────────────────
@@ -199,7 +217,7 @@ st.dataframe(df.head(20), use_container_width=True)
 st.write(f"Rows: {len(df):,} | Unique clusters: {df['Cluster'].nunique():,}")
 
 # ──────────────────────────────────────────────────────────────────────
-# 1) Build one summary per Cluster & embed
+# 1) Build one summary per Cluster & embed (with progress)
 # ──────────────────────────────────────────────────────────────────────
 st.subheader("Step 1 — Embedding clusters")
 stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
@@ -207,12 +225,9 @@ stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
 cluster_names = list(map(str, cluster_groups.keys()))
 
-summaries = []
-for cname in cluster_names:
-    summaries.append(build_cluster_summary(cname, cluster_groups[cname], stops, max_keywords_for_summary))
+summaries = [build_cluster_summary(c, cluster_groups[c], stops, max_keywords_for_summary) for c in cluster_names]
 
-emb = embed_texts_cached(tuple(summaries))
-emb = normalize(emb, axis=1)
+emb = embed_in_batches(summaries, batch_size=embed_batch_size)
 st.success(f"✅ Embedded {len(cluster_names):,} clusters.")
 
 # ──────────────────────────────────────────────────────────────────────
@@ -223,12 +238,9 @@ with st.spinner("Building k-NN graph…"):
     nn = NearestNeighbors(n_neighbors=min(k_neighbors + 1, len(cluster_names)), metric="cosine", n_jobs=-1)
     nn.fit(emb)
     dists, idxs = nn.kneighbors(emb, return_distance=True)
-    # Drop self neighbors (first column is self: dist=0)
-    dists, idxs = dists[:, 1:], idxs[:, 1:]
-    # Convert cosine distance -> similarity
+    dists, idxs = dists[:, 1:], idxs[:, 1:]  # drop self
     sims = 1.0 - dists
 
-# Keep edges >= threshold
 rows, cols, data = [], [], []
 thr = float(sim_threshold)
 for i in range(idxs.shape[0]):
@@ -241,11 +253,9 @@ for i in range(idxs.shape[0]):
     cols.extend(js.tolist())
     data.extend(ss.tolist())
 
-# Sparse adjacency; symmetrize with max()
 A = coo_matrix((data, (rows, cols)), shape=(len(cluster_names), len(cluster_names))).tocsr()
-A = A.maximum(A.T)
+A = A.maximum(A.T)  # symmetrize
 
-# Connected components = hubs (pre-merge of tiny hubs happens later)
 n_comp, labels = connected_components(A, directed=False)
 st.write(f"Initial hubs (components): {n_comp}")
 
@@ -262,36 +272,30 @@ small_labels = [lab for lab, sz in sizes.items() if sz < min_hub_size]
 
 if small_labels:
     st.caption(f"Merging {len(small_labels)} tiny hubs (<{min_hub_size}) to nearest large hub…")
-    # Precompute each node's best neighbor hub (by max similarity edge)
-    # Use adjacency A (CSR) for quick row access
     new_labels = labels.copy()
     for lab in small_labels:
         nodes = label_to_nodes[lab]
         for i in nodes:
             row = A.getrow(i)
             if row.nnz == 0:
-                # isolated: attach to globally most similar point
-                # find top neighbor from knn list (already computed)
+                # isolated: attach to top kNN neighbor
                 j = idxs[i, 0]
                 new_labels[i] = new_labels[j]
                 continue
-            # among neighbors, choose the neighbor with max sim and take its label
             j = row.indices[np.argmax(row.data)]
             new_labels[i] = new_labels[j]
     labels = new_labels
 else:
     st.caption("No tiny hubs to merge.")
 
-# Rebuild label groups after merge
+# Rebuild groups and renumber to 0..H-1
 label_to_nodes = {}
 for i, lab in enumerate(labels):
     label_to_nodes.setdefault(lab, []).append(i)
 
-# Renumber hubs to 0..H-1 (stable)
 unique_labels = sorted(label_to_nodes.keys())
 label_map = {lab: k for k, lab in enumerate(unique_labels)}
 hub_ids = np.array([label_map[lab] for lab in labels], dtype=int)
-
 n_hubs = len(unique_labels)
 st.success(f"✅ Final hubs after merge: {n_hubs}")
 
@@ -299,36 +303,31 @@ st.success(f"✅ Final hubs after merge: {n_hubs}")
 # 4) Name hubs (fast). GPT optional; deterministic fallback.
 # ──────────────────────────────────────────────────────────────────────
 st.subheader("Step 4 — Naming hubs")
-# Build a simple "centrality" score using sum of edge weights within hub (approx medoid)
-A_csr = A  # already CSR
-central_idx = np.zeros(n_hubs, dtype=int)
 
+# Choose a medoid-like representative by internal edge weight
+central_idx = np.zeros(n_hubs, dtype=int)
 for lab, nodes in label_to_nodes.items():
     if len(nodes) == 1:
         central_idx[label_map[lab]] = nodes[0]
         continue
     scores = []
     for i in nodes:
-        row = A_csr.getrow(i)
-        # sum only weights to nodes in this hub
+        row = A.getrow(i)
         mask = np.isin(row.indices, nodes, assume_unique=False)
         scores.append(row.data[mask].sum() if mask.any() else 0.0)
     best_local = int(np.argmax(scores))
     central_idx[label_map[lab]] = nodes[best_local]
 
 def default_title_from_cluster_name(cname: str) -> str:
-    # Clean, title-case, and trim length
     t = " ".join(str(cname).strip().split())
     return t[:80].title() if t else "Topic"
 
-# Prepare hub inputs
 hub_examples: Dict[int, List[str]] = {}
 for hid, nodes in label_to_nodes.items():
-    example_names = [cluster_names[i] for i in nodes[:6]]  # a few examples
-    hub_examples[label_map[hid]] = example_names
+    hub_examples[label_map[hid]] = [cluster_names[i] for i in nodes[:6]]
 
 def make_prompt(centroid_name: str, centroid_summary: str, examples: List[str]) -> str:
-    ex = "\n".join(f"- {e}" for e in examples)
+    ex = "\n".join(f"- {e}" for e in examples) if examples else "- (none)"
     return f"""
 You are naming a website content hub. Provide a short, navigational, 2–4 word Title Case name.
 
@@ -340,13 +339,13 @@ Centroid cluster (representative):
 - summary: {centroid_summary}
 
 Other example clusters in this hub:
-{ex if ex else "- (none)"}
+{ex}
 
 Rules:
 - 2–4 words, Title Case.
 - Avoid generic names like "Misc", "General", "Education".
-- Prefer the academic/subject/qualification phrasing that would appear in site navigation.
-- No punctuation beyond simple spaces. No emojis. No quotes.
+- Prefer academic/subject/qualification phrasing that would appear in site navigation.
+- No punctuation beyond spaces. No emojis. No quotes.
 """.strip()
 
 @st.cache_data(show_spinner=False)
@@ -399,7 +398,6 @@ st.success("✅ Hubs named.")
 # 5) Write results with identical columns (only 'Topical cluster' changes)
 # ──────────────────────────────────────────────────────────────────────
 st.subheader("Step 5 — Write results (identical headers)")
-# Map each cluster name → hub title
 cluster_to_title = {cluster_names[i]: hub_titles[hub_ids[i]] for i in range(len(cluster_names))}
 
 df_out = df.copy()
@@ -427,6 +425,7 @@ sizes_list = sorted([(hub_titles[label_map[lab]], len(nodes)) for lab, nodes in 
 diag = pd.DataFrame(sizes_list, columns=["Topical cluster", "Clusters"])
 st.write(f"Hubs: {len(diag):,}")
 st.dataframe(diag.head(30), use_container_width=True)
+
 
 
 
