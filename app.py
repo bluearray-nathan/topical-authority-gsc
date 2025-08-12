@@ -237,6 +237,67 @@ def call_openai_json(prompt: str, max_tokens: int = 1200, temperature: float = 0
                 except Exception:
                     pass
         raise ValueError("Could not parse JSON from LLM response.")
+# --- strict JSON caller (stronger than call_openai_json) ---
+def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, retries: int = 4) -> dict:
+    def _ask(p: str, json_mode: bool) -> str:
+        kwargs = dict(
+            model="gpt-4o-mini",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": p}],
+        )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        return openai_client.chat.completions.create(**kwargs).choices[0].message.content.strip()
+
+    # 1) JSON mode
+    try:
+        return json.loads(_ask(prompt, True))
+    except Exception:
+        pass
+
+    # 2) Stricter wrapper
+    strict = "Return ONLY valid minified JSON. No prose, no markdown.\n\n" + prompt
+    for _ in range(max(1, retries - 2)):
+        try:
+            return json.loads(_ask(strict, True))
+        except Exception:
+            time.sleep(rate_limit_delay)
+
+    # 3) Repair then largest-block fallback
+    raw = _ask(prompt, False)
+    try:
+        repair = f"Fix to valid JSON. Output ONLY JSON.\n\n{raw}"
+        return json.loads(_ask(repair, True))
+    except Exception:
+        for ob, cb in [("{","}"), ("[","]")]:
+            s, e = raw.find(ob), raw.rfind(cb)
+            if s != -1 and e != -1 and e > s:
+                try:
+                    return json.loads(raw[s:e+1])
+                except Exception:
+                    pass
+        raise ValueError("Could not parse JSON from LLM response.")
+
+# --- pick at most K hubs maximizing diversity (no k-means needed) ---
+def pick_diverse_hubs(hubs: List[Dict[str,Any]], k: int) -> List[Dict[str,Any]]:
+    if len(hubs) <= k:
+        return hubs
+    sigs = [hub_signature(h) for h in hubs]
+    V = embed_texts_cached(tuple(sigs))
+    V = normalize(V, axis=1)
+    # Start with the shortest title (usually cleanest)
+    start = int(np.argmin([len(h.get("title","")) for h in hubs]))
+    chosen = [start]
+    # Farthest-point sampling
+    sims = V @ V[start].reshape(-1,1)
+    min_sim = sims.ravel()
+    while len(chosen) < k:
+        idx = int(np.argmin(min_sim))
+        chosen.append(idx)
+        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1,1)).ravel())
+    chosen = sorted(set(chosen))
+    return [hubs[i] for i in chosen]
 
 # ──────────────────────────────────────────────────────────────────────
 # Prompts
@@ -472,12 +533,42 @@ if use_map_reduce:
     st.caption("Consolidating shard hubs by semantic similarity…")
     consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim)
 
-    st.caption("LLM consolidation of merged hubs (cap to max hubs)…")
-    llm_consolidated = call_openai_json(
-        consolidate_taxonomy_prompt(consolidated, max_hubs_param=max_hubs),
-        max_tokens=1800, temperature=temperature
-    )
-    hubs_list = llm_consolidated.get("hubs", [])
+    st.caption("LLM consolidation of merged hubs (chunked, robust)…")
+
+# 1) Pre-trim each candidate for compact JSON
+def _trim(h):
+    return {
+        "id": str(h.get("id",""))[:80],
+        "title": str(h.get("title",""))[:80],
+        "parent_id": h.get("parent_id", None),
+        "accepts": [a for a in h.get("accepts", []) if isinstance(a,str)][:12],
+        "avoid":   [a for a in h.get("avoid",   []) if isinstance(a,str)][:12],
+    }
+candidates = [_trim(h) for h in consolidated]
+
+# 2) Chunk candidates to avoid oversized prompts
+chunk_size = 280  # ~safe with 1700 tokens
+chunks = [candidates[i:i+chunk_size] for i in range(0, len(candidates), chunk_size)]
+
+merged_parts = []
+for idx, ch in enumerate(chunks, 1):
+    prompt = consolidate_taxonomy_prompt(ch, max_hubs_param=min(max_hubs, hubs_per_shard*2))
+    try:
+        out = call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
+        merged_parts.extend(out.get("hubs", []))
+    except Exception as e:
+        st.warning(f"Consolidation chunk {idx} failed; falling back to candidates unchanged for this chunk.")
+        merged_parts.extend(ch)
+
+# 3) Embedding consolidation over all merged parts
+merged_once = consolidate_hubs_by_similarity(merged_parts, consolidation_sim)
+
+# 4) Final cap to max_hubs:
+if len(merged_once) > max_hubs:
+    hubs_list = pick_diverse_hubs(merged_once, max_hubs)
+else:
+    hubs_list = merged_once
+
 
 else:
     # Legacy single-shot sample (optional)
