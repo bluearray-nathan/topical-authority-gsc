@@ -1,7 +1,6 @@
 # app.py
-# Topical Hubs (LLM IA, clusters-only) with Map-Reduce taxonomy, consolidation, and gap-fill.
-# - Builds a taxonomy (hubs) from ALL clusters via shards, consolidates, then assigns every cluster.
-# - Preserves exact CSV headers & order. Overwrites only the values in "Topical cluster".
+# Topical Hubs (LLM IA, clusters-only) with Map-Reduce taxonomy, consolidation (with progress),
+# and robust gap-fill. Preserves exact CSV headers & order; overwrites only "Topical cluster".
 
 # ---- Safe watcher so Streamlit starts even on low inotify limits ----
 import os
@@ -14,10 +13,12 @@ os.environ.setdefault(
 import io
 import json
 import time
+import math
 import hashlib
 from typing import Dict, List, Tuple, Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures as _cf
 
 import streamlit as st
 import pandas as pd
@@ -63,7 +64,7 @@ st.sidebar.header("🔧 Settings")
 
 # Map-Reduce taxonomy controls
 use_map_reduce       = st.sidebar.checkbox("Use map-reduce taxonomy (cover all clusters)", value=True)
-shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 900, 50)
+shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 800, 50)
 hubs_per_shard       = st.sidebar.slider("Max hubs per shard", 20, 80, 50, 5)
 consolidation_sim    = st.sidebar.slider("Consolidation similarity (hub title+accepts)", 0.86, 0.98, 0.96, 0.01)
 gapfill_max_new_hubs = st.sidebar.slider("Gap-fill: max extra hubs", 10, 100, 40, 5)
@@ -90,9 +91,9 @@ max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48,
 rate_limit_delay   = st.sidebar.slider("Base backoff on 429/5xx (seconds)", 0.5, 10.0, 2.0, 0.5)
 temperature        = st.sidebar.slider("GPT temperature (IA & assignment)", 0.0, 1.0, 0.0, 0.1)  # default 0.0
 
-# NEW: network/LLM stability controls
-timeout_openai = st.sidebar.slider("OpenAI request timeout (sec)", 20, 240, 90, 10)
-shard_workers  = st.sidebar.slider("Shard generator workers", 1, 16, 6, 1)
+# NEW: network/LLM stability controls (lower concurrency + timeouts)
+timeout_openai = st.sidebar.slider("OpenAI request timeout (sec)", 20, 240, 60, 10)
+shard_workers  = st.sidebar.slider("Shard generator workers", 1, 16, 4, 1)
 
 # Summaries & stop-tokens (keep minimal to avoid over-merging)
 max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
@@ -296,12 +297,18 @@ def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, re
                     pass
         raise ValueError("Could not parse JSON from LLM response.")
 
-def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: float) -> List[Dict[str, Any]]:
+def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: float, show_progress: bool = False) -> List[Dict[str, Any]]:
+    """Merge near-duplicate hubs by cosine similarity on (title + accepts).
+       When show_progress=True, display progress for the block merge."""
     if not hubs:
         return hubs
+    # Embedding phase
+    if show_progress:
+        st.caption("Embedding hub candidates…")
     texts = [hub_signature(h) for h in hubs]
     V = embed_texts_cached(tuple(texts))
     V = normalize(V, axis=1)
+
     n = V.shape[0]
     parent = list(range(n))
 
@@ -316,7 +323,15 @@ def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: fl
         if ra != rb:
             parent[rb] = ra
 
+    # Blocked similarity with triangular loop
     blk = 1024
+    blocks = math.ceil(n / blk)
+    total_steps = blocks * (blocks + 1) // 2
+    step = 0
+    prog = st.progress(0.0) if show_progress else None
+    if show_progress:
+        st.caption("Merging hubs by semantic similarity…")
+
     for i0 in range(0, n, blk):
         A = V[i0:i0 + blk]
         for j0 in range(i0, n, blk):
@@ -328,6 +343,12 @@ def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: fl
                 j = j0 + aj[k]
                 if i < j:
                     union(i, j)
+            step += 1
+            if prog:
+                prog.progress(min(1.0, step / total_steps))
+
+    if prog:
+        prog.empty()
 
     groups = defaultdict(list)
     for i in range(n):
@@ -335,7 +356,7 @@ def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: fl
 
     merged = []
     seen_titles = set()
-    for root, idxs in groups.items():
+    for _, idxs in groups.items():
         members = [hubs[i] for i in idxs]
         titles = [m.get("title", "").strip() for m in members if m.get("title")]
         best_title = sorted(titles, key=len)[0] if titles else "Topic"
@@ -525,7 +546,8 @@ if use_map_reduce:
 
     # --- Robust shard runner: JSON mode → split recursively on failure ---
     def run_shard_recursive(shard_idx: int, items: list, max_hubs_this: int, depth: int = 0) -> dict:
-        char_budget = 70_000
+        # ↓↓↓ Reduced char budget to avoid oversized prompts that hang ↓↓↓
+        char_budget = 45_000
         s_items, chars = [], 0
         for it in items:
             t = len(it["summary"])
@@ -544,21 +566,39 @@ if use_map_reduce:
             bad_shards.append({"shard_index": shard_idx, "error": str(e), "count": len(s_items), "depth": depth})
             return _heuristic_hubs_from_items(s_items, max_hubs_this)
 
-    st.caption(f"Starting {len(shards)} shards with {shard_workers} workers, timeout {timeout_openai}s per LLM call.")
+    st.caption(f"Starting {len(shards)} shards with {shard_workers} workers, timeout {timeout_openai}s per call.")
     progress = st.progress(0.0)
     with ThreadPoolExecutor(max_workers=shard_workers) as ex:
-        futures = {ex.submit(run_shard_recursive, i, s, hubs_per_shard): i for i, s in enumerate(shards)}
+        fut_to_idx = {ex.submit(run_shard_recursive, i, s, hubs_per_shard): i for i, s in enumerate(shards)}
+        pending = set(fut_to_idx.keys())
         done = 0
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            done += 1
-            try:
-                out = fut.result()
-                per_shard_hubs.extend(out.get("hubs", []))
-            except Exception:
-                st.warning(f"Shard {idx} failed: Could not parse JSON from LLM response.")
-            progress.progress(done / len(shards))
+        last_finish = time.time()
+        stall_warn_secs = 120
+        stall_note = st.empty()
+
+        while pending:
+            done_now, pending = _cf.wait(pending, timeout=1.0, return_when=_cf.FIRST_COMPLETED)
+            now = time.time()
+            if done_now:
+                last_finish = now
+                for fut in done_now:
+                    idx = fut_to_idx[fut]
+                    try:
+                        out = fut.result()
+                        per_shard_hubs.extend(out.get("hubs", []))
+                    except Exception:
+                        st.warning(f"Shard {idx} failed: Could not parse JSON from LLM response.")
+                    done += 1
+                progress.progress(done / len(shards))
+                stall_note.empty()
+            else:
+                if now - last_finish >= stall_warn_secs:
+                    stall_note.info(f"⏳ No shards finished for {int(now - last_finish)}s… "
+                                    f"(workers={shard_workers}, timeout={timeout_openai}s). "
+                                    f"This is usually rate-limits/backoff. It will continue automatically.")
+
     progress.empty()
+    stall_note.empty()
 
     if bad_shards:
         bad_df = pd.DataFrame(bad_shards)
@@ -566,7 +606,7 @@ if use_map_reduce:
                            "failed_shards.csv", "text/csv")
 
     st.caption("Consolidating shard hubs by semantic similarity…")
-    consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim)
+    consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim, show_progress=True)
 
     st.caption("LLM consolidation of merged hubs (chunked, robust)…")
 
@@ -922,6 +962,7 @@ st.subheader("Hub distribution (top 25)")
 dist = pd.Series([assigned_map.get(c, "Misc") for c in cluster_names]).value_counts().head(25).reset_index()
 dist.columns = ["Topical cluster", "Clusters"]
 st.dataframe(dist, use_container_width=True)
+
 
 
 
