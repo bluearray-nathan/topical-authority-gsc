@@ -4,37 +4,35 @@ import os
 import io
 import json
 import time
-import math
-import random
 import hashlib
-import traceback
 from typing import Dict, List, Tuple
-from collections import defaultdict, Counter
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import normalize
+from sklearn.decomposition import PCA
+import hdbscan
+
 from openai import OpenAI
 from google.cloud import aiplatform
 from google import genai
 from google.genai.types import EmbedContentConfig
-import hdbscan
 
 # ──────────────────────────────────────────────────────────────────────
-# Page config
+# Page
 # ──────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Cluster Renamer + Topical Grouper (Scaled)", page_icon="🧭", layout="wide")
-st.title("🧭 Cluster Renamer → Topical Grouper (Scaled)")
-st.caption("Keeps your CSV headers identical. Only 'Cluster' and 'Topical cluster' values are updated.")
+st.set_page_config(page_title="Arden Topical Clusters (Hubs)", page_icon="🧭", layout="wide")
+st.title("🧭 Build Topical Clusters (Content Hubs) for Arden-like CSVs")
+st.caption("Only the values in 'Cluster' and 'Topical cluster' are changed. All other headers & order are preserved.")
 
 # ──────────────────────────────────────────────────────────────────────
-# Credentials & clients (same pattern you used)
+# Credentials (same pattern as before)
 # ──────────────────────────────────────────────────────────────────────
-vertex_secret = dict(st.secrets["vertex_ai"])  # copy AttrDict → dict
+vertex_secret = dict(st.secrets["vertex_ai"])
 region        = vertex_secret.get("region", "us-central1")
 vertex_secret.pop("region", None)
 
@@ -58,58 +56,55 @@ openai_client = OpenAI()
 st.sidebar.header("🔧 Settings")
 
 strictness = st.sidebar.radio(
-    "Topical grouping strictness (HDBSCAN)",
+    "Grouping strictness (HDBSCAN)",
     options=["Soft", "Medium", "Hard"],
     index=1,
     help="Soft = broader hubs; Hard = tighter, more specific hubs."
 )
 
-# Heuristic presets for HDBSCAN on PCA-reduced cluster-embeddings
+# Tuned presets: smaller min_cluster_size + epsilon helps avoid mega-buckets
 HDBSCAN_PRESETS = {
-    "Soft":   {"min_cluster_size": 8,  "min_samples": 2},
-    "Medium": {"min_cluster_size": 15, "min_samples": 5},
-    "Hard":   {"min_cluster_size": 25, "min_samples": 10},
+    "Soft":   {"min_cluster_size": 6,  "min_samples": 1, "epsilon": 0.10},
+    "Medium": {"min_cluster_size": 10, "min_samples": 2, "epsilon": 0.06},
+    "Hard":   {"min_cluster_size": 16, "min_samples": 4, "epsilon": 0.03},
 }
-hdb_params = HDBSCAN_PRESETS[strictness]
+preset = HDBSCAN_PRESETS[strictness]
 
-max_keywords_for_naming = st.sidebar.slider(
-    "Keywords per cluster sent to GPT (for naming)",
-    min_value=5, max_value=30, value=12, step=1
+# After HDBSCAN, merge clusters only if their centroids are very similar
+CENTROID_MERGE_THRESH = {"Soft": 0.86, "Medium": 0.89, "Hard": 0.92}
+merge_tau = CENTROID_MERGE_THRESH[strictness]
+
+use_pca = st.sidebar.checkbox("Use PCA before HDBSCAN", value=False,
+                              help="Skipping PCA often preserves finer distinctions.")
+pca_components = st.sidebar.slider("PCA components (if used)", 5, 50, 25, 1)
+
+# Tokens that cause over-merging (downweight/remove in summaries). Keep geo terms.
+stop_default = "a level,a-level,level,course,courses,degree,degrees,education,ai,guide,hub,near me,programme,program,study,studies,learn,learning,university,uni,college"
+stop_tokens = st.sidebar.text_area(
+    "Tokens to downweight/remove (comma-separated)",
+    value=stop_default,
+    height=80,
+    help="Common boilerplate tokens that cause over-merging. Geo tokens are kept."
 )
 
+max_keywords_for_summary = st.sidebar.slider("Keywords used in summary per cluster", 4, 20, 10, 1)
+max_keywords_for_naming  = st.sidebar.slider("Keywords sent to GPT for cluster naming", 5, 30, 12, 1)
+
+max_workers_topical_naming = st.sidebar.slider("Parallel GPT workers (topical naming)", 1, 64, 16, 1)
 temperature = st.sidebar.slider("GPT temperature (naming)", 0.0, 1.0, 0.2, 0.1)
-max_workers = st.sidebar.slider("Parallel naming workers", 1, 128, 48, 1,
-                                help="Higher = faster until you hit API rate limits. Use with care.")
-rate_limit_delay = st.sidebar.slider("Backoff base wait (seconds) on 429/errors", 0.5, 10.0, 2.0, 0.5)
+rate_limit_delay = st.sidebar.slider("Backoff base wait on 429/errors (sec)", 0.5, 10.0, 2.0, 0.5)
 
-benchmark_mode = st.sidebar.checkbox("Benchmark mode (sample & estimate total time)")
-benchmark_sample_size = st.sidebar.slider("Benchmark sample size (# clusters)", 100, 2000, 500, 50)
-
-# ──────────────────────────────────────────────────────────────────────
-# Helpers — hashing & caching
-# ──────────────────────────────────────────────────────────────────────
-def cluster_signature(rows: pd.DataFrame, top_k: int) -> str:
-    """Create a stable signature of a cluster content to cache GPT naming."""
-    if "Search volume" in rows.columns:
-        tmp = rows.copy()
-        tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
-        kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
-    else:
-        kws = rows["Keyword"].astype(str).tolist()[:top_k]
-    sig = "\n".join(kws)
-    return hashlib.sha256(sig.encode("utf-8")).hexdigest()
-
-@st.cache_resource(show_spinner=False)
-def get_naming_cache() -> Dict[str, str]:
-    """Process-lifetime cache: sig -> GPT name."""
-    return {}
+keep_identical_headers = st.sidebar.checkbox(
+    "Keep output columns identical to input (overwrite only 'Cluster' and 'Topical cluster')",
+    value=True
+)
 
 # ──────────────────────────────────────────────────────────────────────
-# Embedding (Vertex) — cached
+# Helpers
 # ──────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
-    """Embed a tuple of texts via Vertex AI and cache locally."""
+    """Embed texts via Vertex AI and cache locally."""
     embs = []
     for txt in texts:
         resp = genai_client.models.embed_content(
@@ -123,24 +118,55 @@ def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
         embs.append(resp.embeddings[0].values)
     return np.array(embs, dtype=np.float32)
 
-# ──────────────────────────────────────────────────────────────────────
-# GPT prompts
-# ──────────────────────────────────────────────────────────────────────
-def build_cluster_naming_prompt(cluster_name: str, bullets: str) -> str:
-    return f"""You are naming content hubs for an SEO site architecture.
+def clean_tokens(s: str, stops: set[str]) -> str:
+    txt = s.lower().strip()
+    parts = [p for p in txt.replace("/", " ").replace("|", " ").split() if p]
+    parts = [p for p in parts if p not in stops]
+    return " ".join(parts)
+
+def union_find_merge(centroids: Dict[int, np.ndarray], tau: float) -> Dict[int, int]:
+    """Merge clusters whose centroid cosine similarity >= tau."""
+    from sklearn.preprocessing import normalize as sknorm
+    parent = {i: i for i in centroids}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    ids = list(centroids.keys())
+    mats = np.vstack([centroids[i] for i in ids])
+    mats = sknorm(mats, axis=1)
+    sims = mats @ mats.T
+    n = sims.shape[0]
+    for i in range(n):
+        for j in range(i+1, n):
+            if sims[i, j] >= tau:
+                union(ids[i], ids[j])
+
+    for i in ids:
+        parent[i] = find(i)
+    return parent
+
+def build_cluster_naming_prompt(existing_name: str, bullets: str) -> str:
+    return f"""You are naming content hubs for a university website.
 
 Input: a cluster of closely related keywords (with volumes) about the same intent.
-Your job: produce a concise, human-readable hub name suitable for a website category or hub page.
+Your job: produce a concise, human-readable hub name suitable for a site category or hub page.
 
 Rules:
 - 3–5 words, Title Case.
-- No brand names, no brackets, no pipes, no slashes.
-- Keep consistent geo terms if they are intrinsic (e.g., “Newcastle”).
+- No brand names, brackets, pipes, or slashes.
+- Keep consistent geo or level (e.g., “UK”, “Online”, “Undergraduate”) only if intrinsic.
 - Avoid keyword-stuffing; no “near me” unless intrinsic.
 - Prefer natural-sounding names over exact-match keywords.
 - Do NOT just repeat the highest-volume keyword if it reads awkwardly.
 
-Existing label (may be messy): {cluster_name}
+Existing label (may be messy): {existing_name}
 
 Keywords:
 {bullets}
@@ -148,26 +174,40 @@ Keywords:
 Return ONLY the name, nothing else.
 """.strip()
 
-def build_topical_naming_prompt(member_cluster_names: List[str]) -> str:
-    bullets = "\n".join(f"- {n}" for n in member_cluster_names[:20])
-    return f"""You are naming a higher-level SEO topic hub based on the following cluster names.
+def build_topical_name_prompt(member_cluster_names: List[str]) -> str:
+    bullets = "\n".join(f"- {n}" for n in member_cluster_names[:24])
+    banned = {"AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"}
+    examples = """
+Good Examples:
+- Undergraduate Business Degrees
+- Online Psychology Courses
+- MBA & Executive Management
+- Law & Criminology (UK)
+- Computing & IT Degrees
+
+Bad Examples (DO NOT USE):
+- AI Education Hub
+- A Level
+- Misc
+- Education
+- General
+""".strip()
+    return f"""Name a single higher-level SEO topic hub based on these cluster names.
 
 Cluster names:
 {bullets}
 
 Rules:
 - 2–4 words, Title Case.
-- Avoid generic labels like “Services” or “Products”.
-- No brand names, brackets, or pipes.
-- Keep consistent geo terms if they are intrinsic across the set.
+- Must be specific and navigational (good for a hub page).
+- Avoid generic or banned labels: {", ".join(sorted(banned))}.
+- Include geo/level (e.g., UK, Online, Undergraduate) only if common across members.
+- Return ONLY the name, nothing else.
 
-Return ONLY the name, nothing else.
+{examples}
 """.strip()
 
-# ──────────────────────────────────────────────────────────────────────
-# GPT calling with retries (thread-friendly)
-# ──────────────────────────────────────────────────────────────────────
-def call_openai_name(prompt: str, temperature: float, max_tokens: int = 20) -> str:
+def call_openai_name(prompt: str, temperature: float, max_tokens: int = 24) -> str:
     attempt, wait = 0, rate_limit_delay
     while True:
         attempt += 1
@@ -182,266 +222,219 @@ def call_openai_name(prompt: str, temperature: float, max_tokens: int = 20) -> s
             name = " ".join(name.split())
             name = name.replace("|", "").replace("/", " ").strip()
             return name
-        except Exception as e:
+        except Exception:
             if attempt >= 6:
                 raise
             time.sleep(wait)
-            wait *= 1.8  # exponential backoff
+            wait *= 1.8
 
-# ──────────────────────────────────────────────────────────────────────
-# Naming functions
-# ──────────────────────────────────────────────────────────────────────
-def gpt_name_cluster(orig_name: str, rows: pd.DataFrame) -> str:
-    cache = get_naming_cache()
-    sig = cluster_signature(rows, max_keywords_for_naming)
-    if sig in cache:
-        return cache[sig]
-
-    # build bullets list (top N by volume if available)
-    has_vol = "Search volume" in rows.columns
-    sample = rows.copy()
-    if has_vol:
-        sample["__vol__"] = pd.to_numeric(sample["Search volume"], errors="coerce").fillna(0)
-        sample = sample.sort_values("__vol__", ascending=False)
-    kws = sample["Keyword"].astype(str).tolist()[:max_keywords_for_naming]
-    vols = sample["__vol__"].tolist()[:max_keywords_for_naming] if has_vol else [None]*len(kws)
-
+def gpt_name_cluster(orig_name: str, rows: pd.DataFrame, top_k: int) -> str:
+    """Return a clean 3–5 word human-readable name for the given cluster using top-K keywords by Search volume."""
+    tmp = rows.copy()
+    if "Search volume" in tmp.columns:
+        tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
+        tmp = tmp.sort_values("__vol__", ascending=False)
+    kws = tmp["Keyword"].astype(str).tolist()[:top_k]
+    vols = tmp["__vol__"].tolist()[:top_k] if "__vol__" in tmp.columns else [None]*len(kws)
     bullets = "\n".join(
-        f"- {k} ({int(v)})" if (has_vol and v is not None) else f"- {k}"
+        f"- {k} ({int(v)})" if (v is not None) else f"- {k}"
         for k, v in zip(kws, vols)
     )
     prompt = build_cluster_naming_prompt(orig_name, bullets)
     name = call_openai_name(prompt, temperature=temperature, max_tokens=20) or (orig_name or "Unnamed Cluster")
-    cache[sig] = name
     return name
 
-def gpt_name_topical(member_names: List[str]) -> str:
-    prompt = build_topical_naming_prompt(member_names)
-    return call_openai_name(prompt, temperature=temperature, max_tokens=16) or (member_names[0] if member_names else "Topic")
-
-# ──────────────────────────────────────────────────────────────────────
-# Parallel naming executor
-# ──────────────────────────────────────────────────────────────────────
-def parallel_rename_clusters(cluster_groups: Dict[str, pd.DataFrame]) -> Dict[str, str]:
-    renamed: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+def name_topical_groups(groups: Dict[int, List[str]]) -> Dict[int, str]:
+    """Name topical groups from member cluster names (parallel)."""
+    out = {}
+    with ThreadPoolExecutor(max_workers=max_workers_topical_naming) as ex:
         futs = {}
-        for orig, grp in cluster_groups.items():
-            futs[ex.submit(gpt_name_cluster, str(orig), grp)] = orig
+        for gid, members in groups.items():
+            if gid == -1:
+                out[gid] = "Misc"
+                continue
+            prompt = build_topical_name_prompt(members)
+            futs[ex.submit(call_openai_name, prompt, temperature, 16)] = gid
 
-        done_count = 0
         progress = st.progress(0.0)
-        status = st.empty()
-        total = len(futs)
-
+        done = 0
+        total = max(1, len(futs))
         for fut in as_completed(futs):
-            orig = futs[fut]
+            gid = futs[fut]
             try:
-                new_name = fut.result()
+                nm = fut.result()
+                if nm.lower() in {"misc", "general", "education"} or len(nm) < 3:
+                    nm = groups.get(gid, ["Topic"])[0]
             except Exception as e:
-                new_name = str(orig) if pd.notna(orig) else "Unnamed Cluster"
-                st.warning(f"Naming failed for '{orig}': {e}")
-            renamed[orig] = new_name
-            done_count += 1
-            status.text(f"Renamed {done_count}/{total} clusters")
-            progress.progress(done_count / total)
-
-        progress.empty()
-        status.empty()
-    return renamed
-
-# ──────────────────────────────────────────────────────────────────────
-# Summaries & embeddings for topical grouping
-# ──────────────────────────────────────────────────────────────────────
-def summary_for_group(name: str, grp: pd.DataFrame, top_k: int) -> str:
-    # Use top K keywords by volume if present
-    if "Search volume" in grp.columns:
-        tmp = grp.copy()
-        tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
-        kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()
-    else:
-        kws = grp["Keyword"].astype(str).tolist()
-    kws = kws[:top_k]
-    return f"{name} — " + ", ".join(kws)
-
-def embed_cluster_summaries(renamed_groups: Dict[str, pd.DataFrame]) -> Tuple[List[str], np.ndarray]:
-    names = list(renamed_groups.keys())
-    texts = [summary_for_group(n, renamed_groups[n], max_keywords_for_naming) for n in names]
-
-    emb_bar = st.progress(0.0)
-    embeddings = []
-    B = 128
-    for i in range(0, len(texts), B):
-        batch = texts[i:i+B]
-        arr = embed_texts_cached(tuple(batch))
-        embeddings.append(arr)
-        emb_bar.progress(min(1.0, (i+B)/max(1, len(texts))))
-    emb_bar.empty()
-
-    X = np.vstack(embeddings).astype(np.float32)
-    return names, X
-
-# ──────────────────────────────────────────────────────────────────────
-# Topical grouping with PCA + HDBSCAN
-# ──────────────────────────────────────────────────────────────────────
-def topical_grouping(names: List[str], X: np.ndarray, preset: Dict[str, int]) -> Dict[str, str]:
-    # Normalize (cosine-ish) then reduce for density clustering
-    Xn = normalize(X, norm="l2", axis=1)
-    n_comp = 50 if Xn.shape[0] > 50 else max(2, min(10, Xn.shape[0]-1))
-    Xp = PCA(n_components=n_comp, random_state=42).fit_transform(Xn)
-
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=preset["min_cluster_size"],
-        min_samples=preset["min_samples"],
-        metric="euclidean",
-        cluster_selection_epsilon=0.0,
-        cluster_selection_method="eom"
-    )
-    labels = clusterer.fit_predict(Xp)
-
-    # Build topical groups: label -> member cluster names
-    topical_groups = defaultdict(list)
-    for name, lab in zip(names, labels):
-        topical_groups[int(lab)].append(name)
-
-    # Name each topical group using GPT (based on member cluster names)
-    topical_name_map: Dict[int, str] = {}
-    for gid, members in topical_groups.items():
-        if gid == -1:
-            topical_name_map[gid] = "Misc"
-        else:
-            try:
-                topical_name_map[gid] = gpt_name_topical(members)
-            except Exception as e:
+                nm = groups.get(gid, ["Topic"])[0]
                 st.warning(f"Topical naming failed for group {gid}: {e}")
-                topical_name_map[gid] = members[0] if members else f"Group {gid}"
-
-    # Map cluster name -> topical name
-    cluster_to_topical = {}
-    for gid, members in topical_groups.items():
-        for c in members:
-            cluster_to_topical[c] = topical_name_map[gid]
-    return cluster_to_topical
+            out[gid] = nm
+            done += 1
+            progress.progress(done/total)
+        progress.empty()
+    return out
 
 # ──────────────────────────────────────────────────────────────────────
-# Upload CSV
+# Upload CSV (Arden-like schema)
 # ──────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader("Upload your clustered CSV", type=["csv"])
+uploaded = st.file_uploader("Upload your Arden CSV", type=["csv"])
 if not uploaded:
-    st.info("Awaiting CSV… It should contain at least: Keyword, Cluster, Topical cluster (case-sensitive).")
+    st.info("Awaiting CSV… Must include at least: Keyword, Search volume, Cluster, Topical cluster.")
     st.stop()
 
 csv_bytes = uploaded.getvalue()
 df = pd.read_csv(io.BytesIO(csv_bytes))
-
 st.subheader("Preview")
-st.dataframe(df.head(10), use_container_width=True)
+st.dataframe(df.head(20), use_container_width=True)
 
-# Validate required columns
-required_cols = ["Keyword", "Cluster", "Topical cluster"]
+required_cols = ["Keyword", "Search volume", "Cluster", "Topical cluster"]
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
     st.error(f"Missing required column(s): {', '.join(missing)}")
     st.stop()
 
-# Preserve exact column order for final output
-original_columns = list(df.columns)
+original_columns = list(df.columns)  # preserve exact order
+st.write(f"Rows: {len(df):,}  |  Columns: {len(df.columns)}")
 
 # ──────────────────────────────────────────────────────────────────────
-# Optional: Benchmark mode
+# Step 1 — Rename each Cluster with GPT (using member keywords & volumes)
 # ──────────────────────────────────────────────────────────────────────
-if benchmark_mode:
-    st.subheader("⏱ Benchmark Mode")
-    # sample unique clusters
-    uniq_clusters = list(df["Cluster"].dropna().astype(str).unique())
-    if len(uniq_clusters) == 0:
-        st.error("No clusters found to benchmark.")
-        st.stop()
-
-    sample_n = min(benchmark_sample_size, len(uniq_clusters))
-    sample_clusters = set(random.sample(uniq_clusters, sample_n))
-    sample_df = df[df["Cluster"].astype(str).isin(sample_clusters)].copy()
-
-    # Build groups
-    sample_groups = {name: grp.copy() for name, grp in sample_df.groupby("Cluster", dropna=False)}
-
-    t0 = time.time()
-    sample_renamed = parallel_rename_clusters(sample_groups)
-    t1 = time.time()
-
-    # Apply renamed to sample
-    sample_df["Cluster"] = sample_df["Cluster"].map(lambda x: sample_renamed.get(x, x))
-
-    # Rebuild groups with renamed
-    renamed_groups_sample = {name: grp.copy() for name, grp in sample_df.groupby("Cluster", dropna=False)}
-
-    # Embeddings
-    t2 = time.time()
-    s_names, sX = embed_cluster_summaries(renamed_groups_sample)
-    t3 = time.time()
-
-    # Topical grouping
-    t4 = time.time()
-    s_map = topical_grouping(s_names, sX, hdb_params)
-    t5 = time.time()
-
-    # Stats & projection
-    naming_sec   = t1 - t0
-    embed_sec    = t3 - t2
-    topical_sec  = t5 - t4
-    per_cluster  = naming_sec / max(1, len(sample_groups))
-    total_unique = df["Cluster"].astype(str).nunique()
-    est_total    = per_cluster * total_unique + embed_sec * (total_unique/len(sample_groups)) + topical_sec * (total_unique/len(sample_groups))
-
-    st.info(
-        f"Benchmark on {len(sample_groups)} clusters:\n"
-        f"- Naming:   {naming_sec:.1f}s total  (~{per_cluster:.2f}s/cluster at concurrency {max_workers})\n"
-        f"- Embed:    {embed_sec:.1f}s\n"
-        f"- Topical:  {topical_sec:.1f}s\n"
-        f"\nProjected rough total for {total_unique} clusters: ~{est_total/60:.1f} minutes "
-        f"(very dependent on API latency, rate limits, and concurrency)."
-    )
-    st.divider()
-
-# ──────────────────────────────────────────────────────────────────────
-# 1) Rename clusters (parallel GPT)
-# ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 1 — Renaming clusters with GPT (parallel)")
+st.subheader("Step 1 — Renaming clusters with GPT")
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
-renamed_map = parallel_rename_clusters(cluster_groups)
+progress = st.progress(0.0)
+status   = st.empty()
+
+renamed_map: Dict[str, str] = {}
+total = len(cluster_groups)
+for i, (orig_name, grp) in enumerate(cluster_groups.items(), start=1):
+    status.text(f"Renaming cluster {i}/{total}: {orig_name if isinstance(orig_name, str) else '(blank)'}")
+    try:
+        new_name = gpt_name_cluster(str(orig_name), grp, max_keywords_for_naming)
+    except Exception as e:
+        new_name = str(orig_name) if pd.notna(orig_name) else "Unnamed Cluster"
+        st.warning(f"Naming failed for '{orig_name}': {e}. Kept original.")
+    renamed_map[orig_name] = new_name
+    progress.progress(i / total)
+
+progress.empty()
+status.empty()
 df["Cluster"] = df["Cluster"].map(lambda x: renamed_map.get(x, x))
 
 # ──────────────────────────────────────────────────────────────────────
-# 2) Embed renamed cluster summaries
+# Step 2 — Build summaries & embed (one vector per *renamed* cluster)
+# Summaries use top member keywords (by volume) from this dataset.
 # ──────────────────────────────────────────────────────────────────────
 st.subheader("Step 2 — Embedding cluster summaries for topical grouping")
+
+# Re-group by the new Cluster names
 renamed_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
-cluster_names, X = embed_cluster_summaries(renamed_groups)
+
+stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
+
+def build_summary_for_group(name: str, grp: pd.DataFrame, top_k: int) -> str:
+    tmp = grp.copy()
+    tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
+    kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
+    # clean tokens
+    cleaned = []
+    for k in kws:
+        cleaned.append(clean_tokens(k, stops))
+    cleaned = [c for c in cleaned if c]
+    if not cleaned:
+        return name
+    return f"{name} — " + ", ".join(cleaned)
+
+names = list(renamed_groups.keys())
+summaries = [build_summary_for_group(n, renamed_groups[n], max_keywords_for_summary) for n in names]
+
+emb_bar = st.progress(0.0)
+embeddings = []
+B = 128
+for i in range(0, len(summaries), B):
+    batch = summaries[i:i+B]
+    arr = embed_texts_cached(tuple(batch))
+    embeddings.append(arr)
+    emb_bar.progress(min(1.0, (i+B)/max(1, len(summaries))))
+emb_bar.empty()
+X = np.vstack(embeddings).astype(np.float32)
 
 # ──────────────────────────────────────────────────────────────────────
-# 3) HDBSCAN topical grouping (+ GPT labels)
+# Step 3 — HDBSCAN topical grouping (+ centroid merge)
 # ──────────────────────────────────────────────────────────────────────
 st.subheader(f"Step 3 — Topical grouping with HDBSCAN ({strictness})")
-cluster_to_topical = topical_grouping(cluster_names, X, hdb_params)
-df["Topical cluster"] = df["Cluster"].map(lambda c: cluster_to_topical.get(c, "Misc"))
+Xn = normalize(X, norm="l2", axis=1)
+Xp = Xn
+if use_pca and Xn.shape[0] > pca_components:
+    n_comp = min(pca_components, Xn.shape[0]-1)
+    Xp = PCA(n_components=max(2, n_comp), random_state=42).fit_transform(Xn)
+
+clusterer = hdbscan.HDBSCAN(
+    min_cluster_size=preset["min_cluster_size"],
+    min_samples=preset["min_samples"],
+    metric="euclidean",
+    cluster_selection_epsilon=preset["epsilon"],
+    cluster_selection_method="eom"
+)
+labels = clusterer.fit_predict(Xp)
+
+# Collect members per topical label
+label_to_names: Dict[int, List[str]] = defaultdict(list)
+for nm, lab in zip(names, labels):
+    label_to_names[int(lab)].append(nm)
+
+# Centroid-based merge to prevent accidental mega-buckets
+st.caption("Applying centroid merge to prevent over-broad buckets…")
+centroids: Dict[int, np.ndarray] = {}
+for lab, member_names in label_to_names.items():
+    idxs = [names.index(nm) for nm in member_names]
+    if idxs:
+        centroids[lab] = Xn[idxs].mean(axis=0)
+if len(centroids) > 1:
+    parent_map = union_find_merge(centroids, merge_tau)
+    merged_label_to_names: Dict[int, List[str]] = defaultdict(list)
+    for lab, member_names in label_to_names.items():
+        root = parent_map.get(lab, lab)
+        merged_label_to_names[root].extend(member_names)
+    # dedupe members per merged group
+    label_to_names = {k: sorted(set(v)) for k, v in merged_label_to_names.items()}
 
 # ──────────────────────────────────────────────────────────────────────
-# Output — identical columns & order
+# Step 4 — Name topical clusters (from member cluster names only)
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Result")
-st.caption("Only the values in 'Cluster' and 'Topical cluster' have been changed; headers and order are identical.")
-st.dataframe(df.head(20), use_container_width=True)
+st.subheader("Step 4 — Naming topical clusters")
+topical_name_map = name_topical_groups(label_to_names)
 
+# Build Cluster -> Topical cluster mapping
+cluster_to_topical: Dict[str, str] = {}
+for gid, member_names in label_to_names.items():
+    tname = topical_name_map.get(gid, "Misc")
+    for c in member_names:
+        cluster_to_topical[c] = tname
+
+# Apply back to DataFrame, preserving exact headers & order
+st.subheader("Result & Download")
+df["Topical cluster"] = df["Cluster"].map(lambda c: cluster_to_topical.get(str(c), "Misc"))
+
+# Ensure column order exactly as input
 df_out = df[original_columns]
 csv_out = df_out.to_csv(index=False)
 st.download_button(
-    "⬇️ Download updated CSV",
+    "⬇️ Download updated CSV (identical headers)",
     data=csv_out,
-    file_name="clusters_updated.csv",
+    file_name="arden_topical_clusters_updated.csv",
     mime="text/csv"
 )
 
-st.success("✅ Done. Your CSV headers are unchanged.")
+# Quick distribution preview
+st.divider()
+st.subheader("Topical distribution (preview)")
+preview = (
+    pd.Series([cluster_to_topical.get(c, "Misc") for c in names])
+      .value_counts().head(25).reset_index()
+)
+preview.columns = ["Topical cluster", "Clusters"]
+st.dataframe(preview, use_container_width=True)
+
 
 
 
