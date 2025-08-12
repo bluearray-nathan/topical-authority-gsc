@@ -55,15 +55,15 @@ genai_client  = genai.Client()
 openai_client = OpenAI()
 
 # ──────────────────────────────────────────────────────────────────────
-# Sidebar controls
+# Sidebar controls (defaults tuned for stability/quality)
 # ──────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 Settings")
 
 # Map-Reduce taxonomy controls
 use_map_reduce       = st.sidebar.checkbox("Use map-reduce taxonomy (cover all clusters)", value=True)
-shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 1000, 50)
+shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 900, 50)
 hubs_per_shard       = st.sidebar.slider("Max hubs per shard", 20, 80, 50, 5)
-consolidation_sim    = st.sidebar.slider("Consolidation similarity (hub title+accepts)", 0.86, 0.98, 0.91, 0.01)
+consolidation_sim    = st.sidebar.slider("Consolidation similarity (hub title+accepts)", 0.86, 0.98, 0.96, 0.01)
 gapfill_max_new_hubs = st.sidebar.slider("Gap-fill: max extra hubs", 10, 100, 40, 5)
 
 # Legacy single-shot sampling (optional)
@@ -86,11 +86,11 @@ use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", val
 # Parallelism & retries
 max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48, 1)
 rate_limit_delay   = st.sidebar.slider("Base backoff on 429/5xx (seconds)", 0.5, 10.0, 2.0, 0.5)
-temperature        = st.sidebar.slider("GPT temperature (IA & assignment)", 0.0, 1.0, 0.2, 0.1)
+temperature        = st.sidebar.slider("GPT temperature (IA & assignment)", 0.0, 1.0, 0.0, 0.1)  # default 0.0
 
-# Summaries & stop-tokens
+# Summaries & stop-tokens (keep minimal to avoid over-merging)
 max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
-stop_default = "a level,a-level,level,course,courses,degree,degrees,education,ai,guide,hub,near me,programme,program,study,studies,learn,learning,university,uni,college"
+stop_default = "guide,hub,near me"
 stop_tokens = st.sidebar.text_area(
     "Tokens to downweight/remove in summaries (comma-separated)",
     value=stop_default, height=80
@@ -495,26 +495,59 @@ if use_map_reduce:
     bad_shards = []
     per_shard_hubs = []
 
-    # Robust shard runner with char budget + strict JSON
-    def run_shard(shard_idx: int, shard: list) -> dict:
-        char_budget = 70_000  # keep prompts reasonable
+    # --- Heuristic fallback if even tiny shard fails (never crashes) ---
+    def _heuristic_hubs_from_items(items: list, k: int) -> dict:
+        # Choose up to k cluster titles (shortest, high-volume bias)
+        items_sorted = sorted(items, key=lambda x: (-x.get("total_search_volume", 0), len(x.get("cluster",""))))
+        picks = items_sorted[:max(5, min(k, len(items_sorted)))]
+        hubs = []
+        seen_titles = set()
+        for it in picks:
+            title = str(it.get("cluster","")).strip()
+            if not title:
+                continue
+            t = " ".join(title.split())[:80].title()
+            if t.lower() in seen_titles:
+                continue
+            seen_titles.add(t.lower())
+            toks = [w for w in it.get("summary","").lower().replace("/", " ").replace("|"," ").split() if 2 < len(w) < 20]
+            accepts = sorted(set(toks))[:10]
+            hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in t.upper().replace(" ","_"))
+            hubs.append({"id": hid[:80], "title": t, "parent_id": None, "accepts": accepts, "avoid": []})
+            if len(hubs) >= k:
+                break
+        return {"hubs": hubs}
+
+    # --- Robust shard runner: JSON mode → split recursively on failure ---
+    def run_shard_recursive(shard_idx: int, items: list, max_hubs_this: int, depth: int = 0) -> dict:
+        # Guard: keep prompt compact
+        char_budget = 70_000
         s_items, chars = [], 0
-        for it in shard:
+        for it in items:
             t = len(it["summary"])
             if chars + t > char_budget:
                 break
             s_items.append(it)
             chars += t
-        prompt = shard_taxonomy_prompt(s_items, max_hubs_param=hubs_per_shard)
+
+        prompt = shard_taxonomy_prompt(s_items, max_hubs_param=max_hubs_this)
         try:
             return call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
         except Exception as e:
-            bad_shards.append({"shard_index": shard_idx, "error": str(e), "count": len(s_items)})
-            raise
+            # If large shard failed, split and recurse
+            if len(s_items) > 60 and depth < 3:
+                mid = len(s_items) // 2
+                left  = run_shard_recursive(shard_idx, s_items[:mid],  max_hubs_this, depth + 1)
+                right = run_shard_recursive(shard_idx, s_items[mid:],  max_hubs_this, depth + 1)
+                return {"hubs": (left.get("hubs", []) + right.get("hubs", []))}
+            # Otherwise fallback heuristically (don’t crash the pipeline)
+            bad_shards.append({"shard_index": shard_idx, "error": str(e), "count": len(s_items), "depth": depth})
+            return _heuristic_hubs_from_items(s_items, max_hubs_this)
 
+    # --- Run all shards in parallel with the recursive runner ---
     progress = st.progress(0.0)
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(run_shard, i, s): i for i, s in enumerate(shards)}
+        futures = {ex.submit(run_shard_recursive, i, s, hubs_per_shard): i for i, s in enumerate(shards)}
         done = 0
         for fut in as_completed(futures):
             idx = futures[fut]
@@ -765,7 +798,7 @@ progress.empty()
 status.empty()
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 3b — Gap-fill (optional): propose extra hubs for low-confidence/Misc and reassign
+# Step 3b — Gap-fill (robust): propose extra hubs for low-confidence/Misc and reassign
 # ──────────────────────────────────────────────────────────────────────
 low_conf_or_misc = []
 for cname, res in results_log:
@@ -774,24 +807,82 @@ for cname, res in results_log:
     if (conf < (conf_floor - 0.1)) or (chosen_title == "Misc"):
         low_conf_or_misc.append({"cluster": cname, "summary": cluster_summaries[cname]})
 
+def _pick_diverse_items(items: List[Dict[str, Any]], k: int, field: str = "summary") -> List[Dict[str, Any]]:
+    if len(items) <= k:
+        return items
+    texts = [str(it.get(field, "")) for it in items]
+    V = embed_texts_cached(tuple(texts))
+    V = normalize(V, axis=1)
+    # farthest-point sampling
+    chosen = [0]
+    min_sim = (V @ V[0].reshape(-1, 1)).ravel()
+    while len(chosen) < k:
+        idx = int(np.argmin(min_sim))
+        chosen.append(idx)
+        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1, 1)).ravel())
+    chosen = sorted(set(chosen))
+    return [items[i] for i in chosen]
+
+def _heuristic_hubs_from_items(items: List[Dict[str, Any]], k: int) -> Dict[str, Any]:
+    # create small, reasonable hubs if LLM fails; never crash
+    picks = items[: max(5, min(k, len(items)))]
+    hubs, seen = [], set()
+    for it in picks:
+        t = str(it.get("cluster", "")).strip()
+        if not t:
+            continue
+        title = " ".join(t.split())[:80].title()
+        if title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        toks = [w for w in str(it.get("summary", "")).lower().replace("/", " ").replace("|", " ").split() if 2 < len(w) < 20]
+        accepts = sorted(set(toks))[:10]
+        hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in title.upper().replace(" ", "_"))[:80]
+        hubs.append({"id": hid, "title": title, "parent_id": None, "accepts": accepts, "avoid": []})
+        if len(hubs) >= k:
+            break
+    return {"hubs": hubs}
+
 if low_conf_or_misc and gapfill_max_new_hubs > 0:
     st.caption(f"Gap-fill: proposing up to {gapfill_max_new_hubs} extra hubs for uncovered themes…")
-    extra = call_openai_json(
-        gapfill_taxonomy_prompt(low_conf_or_misc[:1200], gapfill_max_new_hubs),
-        max_tokens=1200, temperature=temperature
-    )
-    extra_hubs = extra.get("hubs", [])
+
+    # keep the prompt small & diverse
+    max_items = 800
+    sample_items = _pick_diverse_items(low_conf_or_misc, max_items)
+
+    # enforce a rough char budget to avoid truncation
+    char_budget = 60_000
+    pruned, chars = [], 0
+    for it in sample_items:
+        s = str(it.get("summary", ""))
+        if chars + len(s) > char_budget:
+            break
+        pruned.append(it)
+        chars += len(s)
+
+    # robust JSON call with fallback
+    try:
+        extra = call_openai_json_strict(
+            gapfill_taxonomy_prompt(pruned, gapfill_max_new_hubs),
+            max_tokens=1100, temperature=0.0  # force stability here
+        )
+        extra_hubs = extra.get("hubs", [])
+    except Exception:
+        st.warning("Gap-fill JSON parse failed; using heuristic fallback.")
+        extra_hubs = _heuristic_hubs_from_items(pruned, gapfill_max_new_hubs).get("hubs", [])
+
     if extra_hubs:
         merged = consolidate_hubs_by_similarity(hubs_list + extra_hubs, consolidation_sim)
         # Rebuild maps
         hubs_list = merged
         hub_id_to_title  = {h["id"]: h["title"] for h in hubs_list}
         hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
-        hub_summaries = [hub_signature(h) for h in hubs_list]
+        hub_summaries = [f'{h["title"]} — ' + ", ".join([t for t in h.get("accepts", []) if isinstance(t, str)]) for h in hubs_list]
         hub_ids_ordered = [h["id"] for h in hubs_list]
         hub_vecs = normalize(embed_texts_cached(tuple(hub_summaries)), axis=1)
 
-        def reassign_one(cname):
+        # Reassign just the problematic clusters
+        def reassign_one(cname: str) -> Tuple[str, str]:
             res = assign_one(cname, cluster_summaries[cname])
             hid = res.get("chosen") or res.get("best")
             return cname, hub_id_to_title.get(hid, "Misc")
