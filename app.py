@@ -1,6 +1,8 @@
-# app.py
-# Topical Hubs (LLM IA, clusters-only) with Map-Reduce taxonomy, consolidation (with progress),
-# and robust gap-fill. Preserves exact CSV headers & order; overwrites only "Topical cluster".
+# app.py — Simple, fast hubming via embeddings + k-NN graph communities
+# - No map-reduce prompts, no JSON consolidation.
+# - Uses Vertex embeddings for clusters; k-NN graph + similarity threshold → communities.
+# - (Optional) GPT only to NAME hubs (small, parallel calls).
+# - Output columns are identical to input; only "Topical cluster" is updated.
 
 # ---- Safe watcher so Streamlit starts even on low inotify limits ----
 import os
@@ -13,18 +15,19 @@ os.environ.setdefault(
 import io
 import json
 import time
-import math
 import hashlib
 from typing import Dict, List, Tuple, Any
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import concurrent.futures as _cf
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 from sklearn.preprocessing import normalize
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.csgraph import connected_components
+
 from openai import OpenAI
 from google.cloud import aiplatform
 from google import genai
@@ -33,9 +36,9 @@ from google.genai.types import EmbedContentConfig
 # ──────────────────────────────────────────────────────────────────────
 # Page config
 # ──────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Topical Hubs (LLM IA, clusters-only)", page_icon="🧭", layout="wide")
-st.title("🧭 Build Topical Hubs (LLM IA, clusters-only)")
-st.caption("Generates a hub taxonomy from your clusters (map-reduce) and assigns each cluster. Only 'Topical cluster' values are changed; headers/order preserved.")
+st.set_page_config(page_title="Topical Hubs (Simple Graph)", page_icon="🧭", layout="wide")
+st.title("🧭 Build Topical Hubs — Simple Graph Method")
+st.caption("Fast: embed clusters → k-NN graph → communities. GPT only names hubs. Output columns unchanged (only 'Topical cluster' is updated).")
 
 # ──────────────────────────────────────────────────────────────────────
 # Credentials (Vertex + OpenAI)
@@ -58,59 +61,36 @@ genai_client  = genai.Client()
 openai_client = OpenAI()
 
 # ──────────────────────────────────────────────────────────────────────
-# Sidebar controls (defaults tuned for stability/quality)
+# Sidebar controls
 # ──────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 Settings")
 
-# Map-Reduce taxonomy controls
-use_map_reduce       = st.sidebar.checkbox("Use map-reduce taxonomy (cover all clusters)", value=True)
-shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 800, 50)
-hubs_per_shard       = st.sidebar.slider("Max hubs per shard", 20, 80, 50, 5)
-consolidation_sim    = st.sidebar.slider("Consolidation similarity (hub title+accepts)", 0.86, 0.98, 0.96, 0.01)
-gapfill_max_new_hubs = st.sidebar.slider("Gap-fill: max extra hubs", 10, 100, 40, 5)
+# Strictness ↔ similarity threshold
+strictness = st.sidebar.radio("Clustering strictness", ["Soft", "Medium", "Hard"], index=1,
+                              help="Higher threshold = tighter (more) hubs.")
+# Good starting points for Vertex text embeddings
+SIM_THRESH = {"Soft": 0.40, "Medium": 0.46, "Hard": 0.53}
+sim_threshold = st.sidebar.slider("Similarity threshold", 0.30, 0.70, SIM_THRESH[strictness], 0.01)
 
-# Legacy single-shot sampling (optional)
-sample_top_n = st.sidebar.slider("Clusters used to design taxonomy (legacy single-shot)", 300, 2000, 1000, 50)
+k_neighbors = st.sidebar.slider("k-NN neighbors per node (k)", 5, 50, 25, 1,
+                                help="Higher k joins more edges; too high may over-merge.")
+min_hub_size = st.sidebar.slider("Min hub size (merge tiny groups to nearest hub)", 1, 10, 2, 1)
 
-# Max hubs & regen/debug controls
-max_hubs = st.sidebar.slider("Max hubs in final taxonomy", 60, 250, 150, 10)
-regenerate_taxonomy = st.sidebar.button("🔄 Regenerate taxonomy (ignore cache)")
-show_raw_taxonomy   = st.sidebar.checkbox("Show raw taxonomy response (debug)", value=False)
-
-# Strictness via confidence thresholds & similarity guard
-strictness = st.sidebar.radio("Assignment strictness", ["Soft", "Medium", "Hard"], index=1)
-CONF_THRESH = {"Soft": 0.45, "Medium": 0.60, "Hard": 0.72}
-SIM_FLOOR   = {"Soft": 0.78, "Medium": 0.82, "Hard": 0.86}
-conf_floor  = CONF_THRESH[strictness]
-sim_floor   = SIM_FLOOR[strictness]
-use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", value=True,
-                                           help="Helps prevent obviously wrong matches. Disable if summaries are too minimal.")
-
-# Parallelism & retries
-max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48, 1)
-rate_limit_delay   = st.sidebar.slider("Base backoff on 429/5xx (seconds)", 0.5, 10.0, 2.0, 0.5)
-temperature        = st.sidebar.slider("GPT temperature (IA & assignment)", 0.0, 1.0, 0.0, 0.1)  # default 0.0
-
-# NEW: network/LLM stability controls (lower concurrency + timeouts)
-timeout_openai = st.sidebar.slider("OpenAI request timeout (sec)", 20, 240, 60, 10)
-shard_workers  = st.sidebar.slider("Shard generator workers", 1, 16, 4, 1)
-
-# Summaries & stop-tokens (keep minimal to avoid over-merging)
+# Embedding summary options
 max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
 stop_default = "guide,hub,near me"
-stop_tokens = st.sidebar.text_area(
-    "Tokens to downweight/remove in summaries (comma-separated)",
-    value=stop_default, height=80
-)
+stop_tokens = st.sidebar.text_area("Downweight/remove tokens in summaries (comma-separated)",
+                                   value=stop_default, height=70)
 
-# Output policy
-keep_identical_headers = st.sidebar.checkbox(
-    "Keep output columns identical to input (overwrite only 'Topical cluster')",
-    value=True
-)
+# GPT naming
+use_gpt_names   = st.sidebar.checkbox("Use GPT to name hubs", value=True)
+gpt_temperature = st.sidebar.slider("GPT temperature (naming)", 0.0, 1.0, 0.0, 0.1)
+naming_workers  = st.sidebar.slider("Parallel naming workers", 1, 64, 16, 1)
+timeout_openai  = st.sidebar.slider("OpenAI request timeout (sec)", 10, 180, 60, 10)
+rate_limit_delay = st.sidebar.slider("Base backoff on 429/5xx (sec)", 0.5, 10.0, 2.0, 0.5)
 
 # Reset caches
-if st.sidebar.button("🗑️ Reset caches (taxonomy, assignments, embeddings)"):
+if st.sidebar.button("🗑️ Reset caches (embeddings & naming)"):
     try:
         st.cache_data.clear()
     except Exception:
@@ -119,25 +99,28 @@ if st.sidebar.button("🗑️ Reset caches (taxonomy, assignments, embeddings)")
         st.cache_resource.clear()
     except Exception:
         pass
-    st.success("Caches cleared. Regenerate the taxonomy and re-run assignment.")
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Tip: If you see too many 'Misc', lower strictness or increase hubs/shard size, then Regenerate taxonomy.")
+    st.success("Caches cleared.")
 
 # ──────────────────────────────────────────────────────────────────────
-# Helpers: hashing, caching, embeddings, prompts, retrying
+# Helpers
 # ──────────────────────────────────────────────────────────────────────
-def file_hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+def clean_tokens(s: str, stops: set[str]) -> str:
+    txt = str(s).lower().strip()
+    parts = [p for p in txt.replace("/", " ").replace("|", " ").split() if p]
+    parts = [p for p in parts if p not in stops]
+    return " ".join(parts)
 
-@st.cache_resource(show_spinner=False)
-def get_assignment_cache() -> Dict[str, Any]:
-    """In-memory cache for assignments: key (cluster summary hash) -> result dict."""
-    return {}
+def build_cluster_summary(name: str, kw_rows: pd.DataFrame, stops: set[str], top_k: int) -> str:
+    tmp = kw_rows.copy()
+    tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
+    kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
+    cleaned = [clean_tokens(k, stops) for k in kws]
+    cleaned = [c for c in cleaned if c]
+    return f"{name} — " + ", ".join(cleaned) if cleaned else name
 
 @st.cache_data(show_spinner=False)
 def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
-    """Embed texts via Vertex AI and cache locally."""
+    """Vertex embeddings with local cache."""
     embs = []
     for txt in texts:
         resp = genai_client.models.embed_content(
@@ -151,112 +134,8 @@ def embed_texts_cached(texts: Tuple[str, ...]) -> np.ndarray:
         embs.append(resp.embeddings[0].values)
     return np.array(embs, dtype=np.float32)
 
-def clean_tokens(s: str, stops: set[str]) -> str:
-    txt = s.lower().strip()
-    parts = [p for p in txt.replace("/", " ").replace("|", " ").split() if p]
-    parts = [p for p in parts if p not in stops]
-    return " ".join(parts)
-
-def build_cluster_summary(name: str, kw_rows: pd.DataFrame, stops: set[str], top_k: int) -> str:
-    tmp = kw_rows.copy()
-    tmp["__vol__"] = pd.to_numeric(tmp["Search volume"], errors="coerce").fillna(0)
-    kws = tmp.sort_values("__vol__", ascending=False)["Keyword"].astype(str).tolist()[:top_k]
-    cleaned = [clean_tokens(k, stops) for k in kws]
-    cleaned = [c for c in cleaned if c]
-    if not cleaned:
-        return name
-    return f"{name} — " + ", ".join(cleaned)
-
-def call_openai(prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
-    """Robust OpenAI call with backoff; returns raw text."""
-    attempt, wait = 0, rate_limit_delay
-    while True:
-        attempt += 1
-        try:
-            resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=temperature,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=timeout_openai,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception:
-            if attempt >= 6:
-                raise
-            time.sleep(wait)
-            wait *= 1.8
-
-def call_openai_json(prompt: str, max_tokens: int = 1200, temperature: float = 0.0, retries: int = 4) -> Any:
-    """
-    Ask for strict JSON and parse; robust to model formatting issues.
-    Strategy:
-      1) Try with response_format=json_object (supported on 4o/mini).
-      2) If parse fails, re-ask with a stricter “ONLY JSON” prompt.
-      3) If still failing, run a “JSON repair” pass, then final bracket extraction.
-    """
-    def _ask(p: str, use_json_mode: bool) -> str:
-        kwargs = dict(
-            model="gpt-4o-mini",
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": p}],
-        )
-        if use_json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = openai_client.chat.completions.create(timeout=timeout_openai, **kwargs)
-        return (resp.choices[0].message.content or "").strip()
-
-    # 1) First try: JSON mode
-    try:
-        text = _ask(prompt, use_json_mode=True)
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # 2) Retry with stricter wrapper
-    strict_prompt = (
-        "Return ONLY valid minified JSON. No prose, no markdown, no comments. "
-        "If the result is large, reduce the number of items but keep the schema identical.\n\n" + prompt
-    )
-    for _ in range(max(1, retries - 2)):
-        try:
-            text = _ask(strict_prompt, use_json_mode=True)
-            return json.loads(text)
-        except Exception:
-            time.sleep(rate_limit_delay)
-
-    # 3) Try to REPAIR malformed JSON
-    raw = _ask(prompt, use_json_mode=False)
-    try:
-        repair_prompt = f"""Fix the following into valid JSON. Output ONLY JSON, no markdown.
-
--------- START
-{raw}
--------- END"""
-        fixed = _ask(repair_prompt, use_json_mode=True)
-        return json.loads(fixed)
-    except Exception:
-        # Final fallback: largest {...} or [...] block
-        for open_b, close_b in [("{", "}"), ("[", "]")]:
-            s, e = raw.find(open_b), raw.rfind(close_b)
-            if s != -1 and e != -1 and e > s:
-                try:
-                    return json.loads(raw[s:e+1])
-                except Exception:
-                    pass
-        raise ValueError("Could not parse JSON from LLM response.")
-
-# ── Consolidation helpers must come AFTER embed_texts_cached ─────────
-BANNED_LABELS = ["AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"]
-
-def hub_signature(h: Dict[str, Any]) -> str:
-    title = h.get("title", "").strip()
-    accepts = ", ".join(h.get("accepts", [])[:12])
-    return f"{title} — {accepts}"
-
-# strict JSON caller for large/fragile prompts
-def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, retries: int = 4) -> dict:
+def call_openai_json(prompt: str, max_tokens: int = 200, temperature: float = 0.0, retries: int = 4) -> Any:
+    """Strict JSON with retries/repair."""
     def _ask(p: str, json_mode: bool) -> str:
         kwargs = dict(
             model="gpt-4o-mini",
@@ -266,7 +145,8 @@ def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, re
         )
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        return openai_client.chat.completions.create(timeout=timeout_openai, **kwargs).choices[0].message.content.strip()
+        resp = openai_client.chat.completions.create(timeout=timeout_openai, **kwargs)
+        return (resp.choices[0].message.content or "").strip()
 
     # 1) JSON mode
     try:
@@ -274,7 +154,7 @@ def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, re
     except Exception:
         pass
 
-    # 2) Stricter wrapper
+    # 2) Strict retry
     strict = "Return ONLY valid minified JSON. No prose, no markdown.\n\n" + prompt
     for _ in range(max(1, retries - 2)):
         try:
@@ -282,198 +162,24 @@ def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, re
         except Exception:
             time.sleep(rate_limit_delay)
 
-    # 3) Repair then largest-block fallback
+    # 3) Repair
     raw = _ask(prompt, False)
     try:
-        repair = f"Fix to valid JSON. Output ONLY JSON.\n\n{raw}"
-        return json.loads(_ask(repair, True))
+        fixed = _ask(f"Fix to valid JSON. Only JSON.\n\n{raw}", True)
+        return json.loads(fixed)
     except Exception:
+        # Fallback: largest JSON block
         for ob, cb in [("{","}"), ("[","]")]:
             s, e = raw.find(ob), raw.rfind(cb)
             if s != -1 and e != -1 and e > s:
-                try:
-                    return json.loads(raw[s:e+1])
-                except Exception:
-                    pass
+                try: return json.loads(raw[s:e+1])
+                except Exception: pass
         raise ValueError("Could not parse JSON from LLM response.")
-
-def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: float, show_progress: bool = False) -> List[Dict[str, Any]]:
-    """Merge near-duplicate hubs by cosine similarity on (title + accepts).
-       When show_progress=True, display progress for the block merge."""
-    if not hubs:
-        return hubs
-    # Embedding phase
-    if show_progress:
-        st.caption("Embedding hub candidates…")
-    texts = [hub_signature(h) for h in hubs]
-    V = embed_texts_cached(tuple(texts))
-    V = normalize(V, axis=1)
-
-    n = V.shape[0]
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    # Blocked similarity with triangular loop
-    blk = 1024
-    blocks = math.ceil(n / blk)
-    total_steps = blocks * (blocks + 1) // 2
-    step = 0
-    prog = st.progress(0.0) if show_progress else None
-    if show_progress:
-        st.caption("Merging hubs by semantic similarity…")
-
-    for i0 in range(0, n, blk):
-        A = V[i0:i0 + blk]
-        for j0 in range(i0, n, blk):
-            B = V[j0:j0 + blk]
-            S = A @ B.T
-            ai, aj = np.where(S >= sim_threshold)
-            for k in range(len(ai)):
-                i = i0 + ai[k]
-                j = j0 + aj[k]
-                if i < j:
-                    union(i, j)
-            step += 1
-            if prog:
-                prog.progress(min(1.0, step / total_steps))
-
-    if prog:
-        prog.empty()
-
-    groups = defaultdict(list)
-    for i in range(n):
-        groups[find(i)].append(i)
-
-    merged = []
-    seen_titles = set()
-    for _, idxs in groups.items():
-        members = [hubs[i] for i in idxs]
-        titles = [m.get("title", "").strip() for m in members if m.get("title")]
-        best_title = sorted(titles, key=len)[0] if titles else "Topic"
-        accepts, avoid = [], []
-        for m in members:
-            accepts.extend([a for a in m.get("accepts", []) if isinstance(a, str)])
-            avoid.extend([a for a in m.get("avoid", []) if isinstance(a, str)])
-        accepts = sorted(set(accepts))[:30]
-        avoid = sorted(set(avoid))[:30]
-        tid = best_title.upper().replace(" ", "_")
-        tid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in tid)
-        if best_title.lower() in seen_titles:
-            tid = tid + "_" + hashlib.md5(best_title.encode()).hexdigest()[:6].upper()
-        seen_titles.add(best_title.lower())
-        merged.append({"id": tid, "title": best_title, "parent_id": None, "accepts": accepts, "avoid": avoid})
-    return merged
-
-def pick_diverse_hubs(hubs: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-    if len(hubs) <= k:
-        return hubs
-    sigs = [hub_signature(h) for h in hubs]
-    V = embed_texts_cached(tuple(sigs))
-    V = normalize(V, axis=1)
-    start = int(np.argmin([len(h.get("title", "")) for h in hubs]))
-    chosen = [start]
-    sims = V @ V[start].reshape(-1, 1)
-    min_sim = sims.ravel()
-    while len(chosen) < k:
-        idx = int(np.argmin(min_sim))
-        chosen.append(idx)
-        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1, 1)).ravel())
-    chosen = sorted(set(chosen))
-    return [hubs[i] for i in chosen]
-
-# ──────────────────────────────────────────────────────────────────────
-# Prompts
-# ──────────────────────────────────────────────────────────────────────
-def taxonomy_prompt(sample_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    return f"""
-Design a two-tier site taxonomy (list of hubs) solely from the following cluster summaries.
-Respond with strict JSON:
-{{
-  "hubs": [
-    {{
-      "id": "UG_BUSINESS",
-      "title": "Undergraduate Business Degrees",
-      "parent_id": null,
-      "accepts": ["business","management","ba","bsc","undergraduate"],
-      "avoid":   ["mba","postgraduate","fees"]
-    }}
-  ],
-  "constraints": {{"max_hubs": {max_hubs_param}, "max_depth": 2}}
-}}
-
-Rules:
-- 60–{max_hubs_param} hubs, 2–4 word Title Case names.
-- Avoid banned titles: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
-- Keep consistent level/mode/geo only if common across items.
-- Favor hubs that align to user navigation; keep granularity consistent across hubs.
-- IDs must be uppercase (A–Z, 0–9, underscores), unique and stable.
-- Include short 'accepts' terms that characterize the hub; include 'avoid' for common confusions.
-- Keep depth at most 2 (parent/child). Parent hubs optional.
-
-Cluster summaries (sample):
-{json.dumps(sample_items, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def shard_taxonomy_prompt(shard_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    return f"""
-Design a list of up to {max_hubs_param} specific hubs for a university website, from ONLY the following cluster summaries (subset/shard).
-Return JSON:
-{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-
-Rules:
-- 2–4 word Title Case titles; avoid: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
-- Keep consistent level/mode/geo only if common in this shard.
-- IDs uppercase underscore, unique within this shard.
-
-Shard cluster summaries:
-{json.dumps(shard_items, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def consolidate_taxonomy_prompt(hubs: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    return f"""
-You are consolidating hub candidates (may contain near-duplicates). Merge synonyms into single hubs.
-Return JSON:
-{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-
-Rules:
-- Keep 60–{max_hubs_param} total; prefer the clearest, navigational title.
-- Merge close titles (synonyms), union their 'accepts', intersect obvious 'avoid'.
-- Avoid banned titles: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
-- Ensure unique IDs and titles.
-
-Candidates:
-{json.dumps(hubs, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def gapfill_taxonomy_prompt(problem_items: List[Dict[str, Any]], max_new: int) -> str:
-    return f"""
-Propose up to {max_new} NEW hubs to cover the following uncovered/low-confidence clusters.
-Return JSON: {{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-Clusters:
-{json.dumps(problem_items, ensure_ascii=False, indent=2)}
-Return JSON only.
-""".strip()
 
 # ──────────────────────────────────────────────────────────────────────
 # Upload CSV
 # ──────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader("Upload your CSV (must include: Keyword, Search volume, Cluster, Topical cluster)", type=["csv"])
+uploaded = st.file_uploader("Upload your CSV (needs: Keyword, Search volume, Cluster, Topical cluster)", type=["csv"])
 if not uploaded:
     st.info("Awaiting CSV…")
     st.stop()
@@ -493,456 +199,211 @@ st.dataframe(df.head(20), use_container_width=True)
 st.write(f"Rows: {len(df):,} | Unique clusters: {df['Cluster'].nunique():,}")
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 1 — Prepare per-cluster summaries (by Search volume)
+# 1) Build one summary per Cluster & embed
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 1 — Preparing cluster summaries")
+st.subheader("Step 1 — Embedding clusters")
 stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
+
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
+cluster_names = list(map(str, cluster_groups.keys()))
 
-cluster_summaries: Dict[str, str] = {}
-cluster_total_vol: Dict[str, float] = {}
-for cname, grp in cluster_groups.items():
-    summary = build_cluster_summary(str(cname), grp, stops, max_keywords_for_summary)
-    cluster_summaries[str(cname)] = summary
-    vol = pd.to_numeric(grp["Search volume"], errors="coerce").fillna(0).sum()
-    cluster_total_vol[str(cname)] = float(vol)
+summaries = []
+for cname in cluster_names:
+    summaries.append(build_cluster_summary(cname, cluster_groups[cname], stops, max_keywords_for_summary))
+
+emb = embed_texts_cached(tuple(summaries))
+emb = normalize(emb, axis=1)
+st.success(f"✅ Embedded {len(cluster_names):,} clusters.")
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 2 — Design taxonomy (map-reduce across ALL clusters, or legacy sample)
+# 2) k-NN graph → prune by similarity threshold → connected components
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 2 — Designing the taxonomy (hubs)")
+st.subheader("Step 2 — Graph communities (no LLM)")
+with st.spinner("Building k-NN graph…"):
+    nn = NearestNeighbors(n_neighbors=min(k_neighbors + 1, len(cluster_names)), metric="cosine", n_jobs=-1)
+    nn.fit(emb)
+    dists, idxs = nn.kneighbors(emb, return_distance=True)
+    # Drop self neighbors (first column is self: dist=0)
+    dists, idxs = dists[:, 1:], idxs[:, 1:]
+    # Convert cosine distance -> similarity
+    sims = 1.0 - dists
 
-if use_map_reduce:
-    st.caption("Map-reduce mode: generating per-shard taxonomies across all clusters…")
-    all_items = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(cluster_total_vol[c])}
-                 for c in cluster_summaries.keys()]
-    all_items_sorted = sorted(all_items, key=lambda x: x["total_search_volume"], reverse=True)
-    shards = [all_items_sorted[i:i + shard_size] for i in range(0, len(all_items_sorted), shard_size)]
+# Keep edges >= threshold
+rows, cols, data = [], [], []
+thr = float(sim_threshold)
+for i in range(idxs.shape[0]):
+    mask = sims[i] >= thr
+    if not np.any(mask):
+        continue
+    js = idxs[i, mask]
+    ss = sims[i, mask]
+    rows.extend([i] * len(js))
+    cols.extend(js.tolist())
+    data.extend(ss.tolist())
 
-    bad_shards = []
-    per_shard_hubs = []
+# Sparse adjacency; symmetrize with max()
+A = coo_matrix((data, (rows, cols)), shape=(len(cluster_names), len(cluster_names))).tocsr()
+A = A.maximum(A.T)
 
-    # --- Heuristic fallback if even tiny shard fails (never crashes) ---
-    def _heuristic_hubs_from_items(items: list, k: int) -> dict:
-        items_sorted = sorted(items, key=lambda x: (-x.get("total_search_volume", 0), len(x.get("cluster",""))))
-        picks = items_sorted[:max(5, min(k, len(items_sorted)))]
-        hubs = []
-        seen_titles = set()
-        for it in picks:
-            title = str(it.get("cluster","")).strip()
-            if not title:
+# Connected components = hubs (pre-merge of tiny hubs happens later)
+n_comp, labels = connected_components(A, directed=False)
+st.write(f"Initial hubs (components): {n_comp}")
+
+# ──────────────────────────────────────────────────────────────────────
+# 3) Merge tiny hubs to nearest neighbor hub (min_hub_size)
+# ──────────────────────────────────────────────────────────────────────
+st.subheader("Step 3 — Merge tiny hubs (if any)")
+label_to_nodes: Dict[int, List[int]] = {}
+for i, lab in enumerate(labels):
+    label_to_nodes.setdefault(lab, []).append(i)
+
+sizes = {lab: len(nodes) for lab, nodes in label_to_nodes.items()}
+small_labels = [lab for lab, sz in sizes.items() if sz < min_hub_size]
+
+if small_labels:
+    st.caption(f"Merging {len(small_labels)} tiny hubs (<{min_hub_size}) to nearest large hub…")
+    # Precompute each node's best neighbor hub (by max similarity edge)
+    # Use adjacency A (CSR) for quick row access
+    new_labels = labels.copy()
+    for lab in small_labels:
+        nodes = label_to_nodes[lab]
+        for i in nodes:
+            row = A.getrow(i)
+            if row.nnz == 0:
+                # isolated: attach to globally most similar point
+                # find top neighbor from knn list (already computed)
+                j = idxs[i, 0]
+                new_labels[i] = new_labels[j]
                 continue
-            t = " ".join(title.split())[:80].title()
-            if t.lower() in seen_titles:
-                continue
-            seen_titles.add(t.lower())
-            toks = [w for w in it.get("summary","").lower().replace("/", " ").replace("|"," ").split() if 2 < len(w) < 20]
-            accepts = sorted(set(toks))[:10]
-            hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in t.upper().replace(" ","_"))
-            hubs.append({"id": hid[:80], "title": t, "parent_id": None, "accepts": accepts, "avoid": []})
-            if len(hubs) >= k:
-                break
-        return {"hubs": hubs}
-
-    # --- Robust shard runner: JSON mode → split recursively on failure ---
-    def run_shard_recursive(shard_idx: int, items: list, max_hubs_this: int, depth: int = 0) -> dict:
-        # ↓↓↓ Reduced char budget to avoid oversized prompts that hang ↓↓↓
-        char_budget = 45_000
-        s_items, chars = [], 0
-        for it in items:
-            t = len(it["summary"])
-            if chars + t > char_budget:
-                break
-            s_items.append(it); chars += t
-        prompt = shard_taxonomy_prompt(s_items, max_hubs_param=max_hubs_this)
-        try:
-            return call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
-        except Exception as e:
-            if len(s_items) > 60 and depth < 3:
-                mid = len(s_items) // 2
-                left  = run_shard_recursive(shard_idx, s_items[:mid],  max_hubs_this, depth + 1)
-                right = run_shard_recursive(shard_idx, s_items[mid:],  max_hubs_this, depth + 1)
-                return {"hubs": (left.get("hubs", []) + right.get("hubs", []))}
-            bad_shards.append({"shard_index": shard_idx, "error": str(e), "count": len(s_items), "depth": depth})
-            return _heuristic_hubs_from_items(s_items, max_hubs_this)
-
-    st.caption(f"Starting {len(shards)} shards with {shard_workers} workers, timeout {timeout_openai}s per call.")
-    progress = st.progress(0.0)
-    with ThreadPoolExecutor(max_workers=shard_workers) as ex:
-        fut_to_idx = {ex.submit(run_shard_recursive, i, s, hubs_per_shard): i for i, s in enumerate(shards)}
-        pending = set(fut_to_idx.keys())
-        done = 0
-        last_finish = time.time()
-        stall_warn_secs = 120
-        stall_note = st.empty()
-
-        while pending:
-            done_now, pending = _cf.wait(pending, timeout=1.0, return_when=_cf.FIRST_COMPLETED)
-            now = time.time()
-            if done_now:
-                last_finish = now
-                for fut in done_now:
-                    idx = fut_to_idx[fut]
-                    try:
-                        out = fut.result()
-                        per_shard_hubs.extend(out.get("hubs", []))
-                    except Exception:
-                        st.warning(f"Shard {idx} failed: Could not parse JSON from LLM response.")
-                    done += 1
-                progress.progress(done / len(shards))
-                stall_note.empty()
-            else:
-                if now - last_finish >= stall_warn_secs:
-                    stall_note.info(f"⏳ No shards finished for {int(now - last_finish)}s… "
-                                    f"(workers={shard_workers}, timeout={timeout_openai}s). "
-                                    f"This is usually rate-limits/backoff. It will continue automatically.")
-
-    progress.empty()
-    stall_note.empty()
-
-    if bad_shards:
-        bad_df = pd.DataFrame(bad_shards)
-        st.download_button("⬇️ Download failed shard report", bad_df.to_csv(index=False),
-                           "failed_shards.csv", "text/csv")
-
-    st.caption("Consolidating shard hubs by semantic similarity…")
-    consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim, show_progress=True)
-
-    st.caption("LLM consolidation of merged hubs (chunked, robust)…")
-
-    def _trim(h):
-        return {
-            "id": str(h.get("id", ""))[:80],
-            "title": str(h.get("title", ""))[:80],
-            "parent_id": h.get("parent_id", None),
-            "accepts": [a for a in h.get("accepts", []) if isinstance(a, str)][:12],
-            "avoid":   [a for a in h.get("avoid",   []) if isinstance(a, str)][:12],
-        }
-
-    candidates = [_trim(h) for h in consolidated]
-
-    chunk_size = 280
-    chunks = [candidates[i:i + chunk_size] for i in range(0, len(candidates), chunk_size)]
-
-    merged_parts = []
-    for idx, ch in enumerate(chunks, 1):
-        prompt = consolidate_taxonomy_prompt(ch, max_hubs_param=min(max_hubs, hubs_per_shard * 2))
-        try:
-            out = call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
-            merged_parts.extend(out.get("hubs", []))
-        except Exception:
-            st.warning(f"Consolidation chunk {idx} failed; falling back to candidates unchanged for this chunk.")
-            merged_parts.extend(ch)
-
-    merged_once = consolidate_hubs_by_similarity(merged_parts, consolidation_sim)
-
-    if len(merged_once) > max_hubs:
-        hubs_list = pick_diverse_hubs(merged_once, max_hubs)
-    else:
-        hubs_list = merged_once
-
+            # among neighbors, choose the neighbor with max sim and take its label
+            j = row.indices[np.argmax(row.data)]
+            new_labels[i] = new_labels[j]
+    labels = new_labels
 else:
-    sorted_clusters = sorted(cluster_total_vol.items(), key=lambda x: x[1], reverse=True)
-    sample = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(v)}
-              for c, v in sorted_clusters[:sample_top_n]]
+    st.caption("No tiny hubs to merge.")
 
-    if len(sample) > 0:
-        total_chars = sum(len(s["summary"]) for s in sample)
-        if total_chars > 180_000:
-            keep = max(400, int(180_000 / (total_chars / len(sample))))
-            sample = sample[:keep]
-            st.warning(f"Large sample trimmed to {keep} items to ensure valid JSON output.")
+# Rebuild label groups after merge
+label_to_nodes = {}
+for i, lab in enumerate(labels):
+    label_to_nodes.setdefault(lab, []).append(i)
 
-    ia_raw = call_openai_json(taxonomy_prompt(sample, max_hubs_param=max_hubs), max_tokens=2000, temperature=temperature)
-    hubs_list = ia_raw.get("hubs", [])
+# Renumber hubs to 0..H-1 (stable)
+unique_labels = sorted(label_to_nodes.keys())
+label_map = {lab: k for k, lab in enumerate(unique_labels)}
+hub_ids = np.array([label_map[lab] for lab in labels], dtype=int)
 
-# Cleanup & validate hubs_list
-seen_ids, seen_titles = set(), set()
-cleaned_hubs = []
-for h in hubs_list:
-    hid = str(h.get("id", "")).upper().strip().replace(" ", "_")
-    hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in hid)
-    title = str(h.get("title", "")).strip()
-    if not hid or not title:
-        continue
-    if hid in seen_ids or title.lower() in seen_titles:
-        continue
-    if title in {"Misc", "General", "Education", "AI Education Hub", "A Level", "A-Level"}:
-        continue
-    seen_ids.add(hid); seen_titles.add(title.lower())
-    cleaned_hubs.append({
-        "id": hid,
-        "title": title,
-        "parent_id": h.get("parent_id", None),
-        "accepts": [a for a in h.get("accepts", [])[:20] if isinstance(a, str)],
-        "avoid":   [a for a in h.get("avoid",   [])[:20] if isinstance(a, str)],
-    })
-
-if show_raw_taxonomy:
-    try:
-        st.code(json.dumps({"hubs": hubs_list}, ensure_ascii=False, indent=2)[:4000], language="json")
-    except Exception:
-        pass
-
-if not cleaned_hubs:
-    st.error("No hubs generated. Loosen settings or disable map-reduce temporarily.")
-    st.stop()
-
-ia = {"hubs": cleaned_hubs, "constraints": {"max_hubs": max_hubs, "max_depth": 2}}
-st.caption("Review/edit the generated taxonomy (optional).")
-ia_text = st.text_area("Taxonomy JSON", json.dumps(ia, ensure_ascii=False, indent=2), height=320)
-try:
-    ia = json.loads(ia_text)
-    hubs_list = ia.get("hubs", [])
-except Exception as e:
-    st.error(f"Invalid JSON in taxonomy editor: {e}")
-    st.stop()
-
-if not hubs_list:
-    st.error("No hubs after editing.")
-    st.stop()
-
-# Build maps for hub metadata & embed for similarity guard
-hub_id_to_title  = {h["id"]: h["title"] for h in hubs_list}
-hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
-hub_summaries = [f'{h["title"]} — ' + ", ".join([t for t in h.get("accepts", []) if isinstance(t, str)]) for h in hubs_list]
-hub_ids_ordered = [h["id"] for h in hubs_list]
-hub_vecs = normalize(embed_texts_cached(tuple(hub_summaries)), axis=1)
+n_hubs = len(unique_labels)
+st.success(f"✅ Final hubs after merge: {n_hubs}")
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 3 — Assign each cluster to best hub (parallel, cached, similarity guard)
+# 4) Name hubs (fast). GPT optional; deterministic fallback.
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 3 — Assigning clusters to hubs")
+st.subheader("Step 4 — Naming hubs")
+# Build a simple "centrality" score using sum of edge weights within hub (approx medoid)
+A_csr = A  # already CSR
+central_idx = np.zeros(n_hubs, dtype=int)
 
-assign_cache = get_assignment_cache()
+for lab, nodes in label_to_nodes.items():
+    if len(nodes) == 1:
+        central_idx[label_map[lab]] = nodes[0]
+        continue
+    scores = []
+    for i in nodes:
+        row = A_csr.getrow(i)
+        # sum only weights to nodes in this hub
+        mask = np.isin(row.indices, nodes, assume_unique=False)
+        scores.append(row.data[mask].sum() if mask.any() else 0.0)
+    best_local = int(np.argmax(scores))
+    central_idx[label_map[lab]] = nodes[best_local]
 
-def assignment_key(cluster_name: str, summary: str) -> str:
-    return hashlib.sha256((cluster_name + "||" + summary).encode("utf-8")).hexdigest()
+def default_title_from_cluster_name(cname: str) -> str:
+    # Clean, title-case, and trim length
+    t = " ".join(str(cname).strip().split())
+    return t[:80].title() if t else "Topic"
 
-def embed_cluster_summary(summary: str) -> np.ndarray:
-    v = embed_texts_cached((summary,))[0]
-    v = v.reshape(1, -1)
-    v = normalize(v, axis=1)
-    return v
+# Prepare hub inputs
+hub_examples: Dict[int, List[str]] = {}
+for hid, nodes in label_to_nodes.items():
+    example_names = [cluster_names[i] for i in nodes[:6]]  # a few examples
+    hub_examples[label_map[hid]] = example_names
 
-def fallback_parent(hid: str) -> str:
-    p = hub_id_to_parent.get(hid)
-    return p if p else hid
-
-def choose_with_similarity_guard(cluster_vec: np.ndarray, best_id: str, alt_ids: List[str]) -> str:
-    if not use_similarity_guard:
-        return best_id
-    sims: List[Tuple[str, float]] = []
-    try:
-        i = hub_ids_ordered.index(best_id)
-        sims.append((best_id, float((cluster_vec @ hub_vecs[i].reshape(-1, 1)).ravel()[0])))
-    except ValueError:
-        pass
-    for aid in alt_ids[:3]:
-        try:
-            j = hub_ids_ordered.index(aid)
-            sims.append((aid, float((cluster_vec @ hub_vecs[j].reshape(-1, 1)).ravel()[0])))
-        except ValueError:
-            continue
-    sims_sorted = sorted(sims, key=lambda x: (x[0] != best_id, -x[1]))
-    for hid, sim in sims_sorted:
-        if sim >= sim_floor:
-            return hid
-    return best_id
-
-def assign_prompt(cluster_name: str, summary: str, hubs_json: Dict[str, Any], strictness_text: str) -> str:
+def make_prompt(centroid_name: str, centroid_summary: str, examples: List[str]) -> str:
+    ex = "\n".join(f"- {e}" for e in examples)
     return f"""
-You assign content clusters to site hubs.
+You are naming a website content hub. Provide a short, navigational, 2–4 word Title Case name.
 
-Strictness: {strictness_text}. Choose the best hub for the cluster below.
-Return strictly this JSON:
-{{"best":"HUB_ID","confidence":0.00,"alts":[["ALT_ID",0.00],["ALT2_ID",0.00]]}}
+Return ONLY this JSON:
+{{"title":"<2-4 word hub name>"}}
+
+Centroid cluster (representative):
+- name: {centroid_name}
+- summary: {centroid_summary}
+
+Other example clusters in this hub:
+{ex if ex else "- (none)"}
 
 Rules:
-- Prefer hubs whose 'accepts' fit and 'avoid' do not match.
-- Keep level/mode/geo if present in the cluster summary.
-- Be conservative: if uncertain, lower confidence.
-- No commentary.
-
-Hubs JSON:
-{json.dumps(hubs_json, ensure_ascii=False)}
-
-Cluster:
-- name: {cluster_name}
-- summary: {summary}
+- 2–4 words, Title Case.
+- Avoid generic names like "Misc", "General", "Education".
+- Prefer the academic/subject/qualification phrasing that would appear in site navigation.
+- No punctuation beyond simple spaces. No emojis. No quotes.
 """.strip()
 
-def assign_one(cluster_name: str, summary: str) -> Dict[str, Any]:
-    key = assignment_key(cluster_name, summary)
-    if key in assign_cache:
-        return assign_cache[key]
-
-    prompt = assign_prompt(cluster_name, summary, {"hubs": hubs_list}, strictness)
-    result = call_openai_json(prompt, max_tokens=300, temperature=temperature)
-
-    best = result.get("best", "")
-    confidence = float(result.get("confidence", 0.0) or 0.0)
-    alts = result.get("alts", [])
-    alt_ids = [a[0] for a in alts if isinstance(a, list) and a and isinstance(a[0], str)]
-
-    chosen = best
-    if confidence < conf_floor:
-        chosen = fallback_parent(best)
-
+@st.cache_data(show_spinner=False)
+def gpt_name_hub(centroid_name: str, centroid_summary: str, examples: Tuple[str, ...],
+                 temperature: float, timeout_s: int) -> str:
+    prompt = make_prompt(centroid_name, centroid_summary, list(examples))
     try:
-        cvec = embed_cluster_summary(summary)
-        chosen = choose_with_similarity_guard(cvec, chosen, alt_ids)
+        out = call_openai_json(prompt, max_tokens=60, temperature=temperature)
+        title = str(out.get("title", "")).strip()
+        return title[:80].title() if title else default_title_from_cluster_name(centroid_name)
     except Exception:
-        pass
+        return default_title_from_cluster_name(centroid_name)
 
-    out = {"best": best, "chosen": chosen, "confidence": confidence, "alts": alts}
-    assign_cache[key] = out
-    return out
-
-cluster_names = list(cluster_summaries.keys())
-cluster_summary_list = [cluster_summaries[c] for c in cluster_names]
-
-assigned_map: Dict[str, str] = {}
-results_log: List[Tuple[str, Dict[str, Any]]] = []
+hub_titles: Dict[int, str] = {}
 progress = st.progress(0.0)
-status   = st.empty()
-
-def worker(args):
-    cname, summary = args
-    try:
-        res = assign_one(cname, summary)
-        hid = res.get("chosen") or res.get("best")
-        title = hub_id_to_title.get(hid, hub_id_to_title.get(res.get("best", ""), "Misc"))
-        return cname, title, res
-    except Exception as e:
-        return cname, "Misc", {"error": str(e)}
-
-tasks = list(zip(cluster_names, cluster_summary_list))
 done = 0
-with ThreadPoolExecutor(max_workers=max_workers_assign) as ex:
-    for cname, title, res in ex.map(worker, tasks):
-        assigned_map[cname] = title
-        results_log.append((cname, res))
+
+if use_gpt_names:
+    tasks = []
+    for k in range(n_hubs):
+        idx = central_idx[k]
+        cname = cluster_names[idx]
+        csum  = summaries[idx]
+        ex    = tuple(hub_examples.get(k, [])[:5])
+        tasks.append((k, cname, csum, ex))
+
+    def worker(task):
+        k, cname, csum, ex = task
+        title = gpt_name_hub(cname, csum, ex, gpt_temperature, timeout_openai)
+        return k, title
+
+    with ThreadPoolExecutor(max_workers=naming_workers) as ex:
+        for k, title in ex.map(worker, tasks):
+            hub_titles[k] = title
+            done += 1
+            if done % 10 == 0 or done == n_hubs:
+                progress.progress(done / n_hubs)
+else:
+    for k in range(n_hubs):
+        idx = central_idx[k]
+        hub_titles[k] = default_title_from_cluster_name(cluster_names[idx])
         done += 1
-        if done % 50 == 0 or done == len(tasks):
-            status.text(f"Assigned {done}/{len(tasks)} clusters")
-            progress.progress(done / len(tasks))
+        if done % 50 == 0 or done == n_hubs:
+            progress.progress(done / n_hubs)
 
 progress.empty()
-status.empty()
+st.success("✅ Hubs named.")
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 3b — Gap-fill (robust): propose extra hubs for low-confidence/Misc and reassign
+# 5) Write results with identical columns (only 'Topical cluster' changes)
 # ──────────────────────────────────────────────────────────────────────
-low_conf_or_misc = []
-for cname, res in results_log:
-    conf = (res or {}).get("confidence", 0.0) if isinstance(res, dict) else 0.0
-    chosen_title = assigned_map.get(cname, "Misc")
-    if (conf < (conf_floor - 0.1)) or (chosen_title == "Misc"):
-        low_conf_or_misc.append({"cluster": cname, "summary": cluster_summaries[cname]})
+st.subheader("Step 5 — Write results (identical headers)")
+# Map each cluster name → hub title
+cluster_to_title = {cluster_names[i]: hub_titles[hub_ids[i]] for i in range(len(cluster_names))}
 
-def _pick_diverse_items(items: List[Dict[str, Any]], k: int, field: str = "summary") -> List[Dict[str, Any]]:
-    if len(items) <= k:
-        return items
-    texts = [str(it.get(field, "")) for it in items]
-    V = embed_texts_cached(tuple(texts))
-    V = normalize(V, axis=1)
-    chosen = [0]
-    min_sim = (V @ V[0].reshape(-1, 1)).ravel()
-    while len(chosen) < k:
-        idx = int(np.argmin(min_sim))
-        chosen.append(idx)
-        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1, 1)).ravel())
-    chosen = sorted(set(chosen))
-    return [items[i] for i in chosen]
-
-def _heuristic_hubs_from_items(items: List[Dict[str, Any]], k: int) -> Dict[str, Any]:
-    picks = items[: max(5, min(k, len(items)))]
-    hubs, seen = [], set()
-    for it in picks:
-        t = str(it.get("cluster", "")).strip()
-        if not t:
-            continue
-        title = " ".join(t.split())[:80].title()
-        if title.lower() in seen:
-            continue
-        seen.add(title.lower())
-        toks = [w for w in str(it.get("summary", "")).lower().replace("/", " ").replace("|", " ").split() if 2 < len(w) < 20]
-        accepts = sorted(set(toks))[:10]
-        hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in title.upper().replace(" ", "_"))[:80]
-        hubs.append({"id": hid, "title": title, "parent_id": None, "accepts": accepts, "avoid": []})
-        if len(hubs) >= k:
-            break
-    return {"hubs": hubs}
-
-if low_conf_or_misc and gapfill_max_new_hubs > 0:
-    st.caption(f"Gap-fill: proposing up to {gapfill_max_new_hubs} extra hubs for uncovered themes…")
-
-    max_items = 800
-    sample_items = _pick_diverse_items(low_conf_or_misc, max_items)
-
-    char_budget = 60_000
-    pruned, chars = [], 0
-    for it in sample_items:
-        s = str(it.get("summary", ""))
-        if chars + len(s) > char_budget:
-            break
-        pruned.append(it); chars += len(s)
-
-    try:
-        extra = call_openai_json_strict(
-            gapfill_taxonomy_prompt(pruned, gapfill_max_new_hubs),
-            max_tokens=1100, temperature=0.0
-        )
-        extra_hubs = extra.get("hubs", [])
-    except Exception:
-        st.warning("Gap-fill JSON parse failed; using heuristic fallback.")
-        extra_hubs = _heuristic_hubs_from_items(pruned, gapfill_max_new_hubs).get("hubs", [])
-
-    if extra_hubs:
-        merged = consolidate_hubs_by_similarity(hubs_list + extra_hubs, consolidation_sim)
-        hubs_list = merged
-        hub_id_to_title  = {h["id"]: h["title"] for h in hubs_list}
-        hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
-        hub_summaries = [f'{h["title"]} — ' + ", ".join([t for t in h.get("accepts", []) if isinstance(t, str)]) for h in hubs_list]
-        hub_ids_ordered = [h["id"] for h in hubs_list]
-        hub_vecs = normalize(embed_texts_cached(tuple(hub_summaries)), axis=1)
-
-        def reassign_one(cname: str) -> Tuple[str, str]:
-            res = assign_one(cname, cluster_summaries[cname])
-            hid = res.get("chosen") or res.get("best")
-            return cname, hub_id_to_title.get(hid, "Misc")
-
-        with ThreadPoolExecutor(max_workers=max_workers_assign) as ex:
-            for cname, title in ex.map(reassign_one, [x["cluster"] for x in low_conf_or_misc]):
-                assigned_map[cname] = title
-
-# Optional: export assignment issues
-issues = []
-for cname, res in results_log:
-    if isinstance(res, dict):
-        if res.get("chosen") is None or hub_id_to_title.get(res.get("chosen", "")) is None:
-            issues.append({
-                "cluster": cname,
-                "reason": "no chosen id or id not in taxonomy",
-                "confidence": res.get("confidence"),
-                "best": res.get("best"),
-                "alts": json.dumps(res.get("alts", []))
-            })
-    else:
-        issues.append({"cluster": cname, "reason": "non-dict result", "raw": str(res)})
-
-if issues:
-    issues_df = pd.DataFrame(issues)
-    st.download_button("⬇️ Download assignment issues (CSV)", issues_df.to_csv(index=False),
-                       file_name="assignment_issues.csv", mime="text/csv")
-
-# ──────────────────────────────────────────────────────────────────────
-# Step 4 — Write results (identical headers)
-# ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 4 — Write results (identical headers)")
 df_out = df.copy()
-df_out["Topical cluster"] = df_out["Cluster"].astype(str).map(lambda c: assigned_map.get(c, "Misc"))
+df_out["Topical cluster"] = df_out["Cluster"].astype(str).map(lambda c: cluster_to_title.get(c, "Misc"))
 
 # Preserve exact column order
 df_out = df_out[original_columns]
@@ -951,17 +412,22 @@ csv_out = df_out.to_csv(index=False)
 st.download_button(
     "⬇️ Download updated CSV (identical headers)",
     data=csv_out,
-    file_name="topical_hubs_llm_clusters_only.csv",
+    file_name="topical_hubs_graph.csv",
     mime="text/csv"
 )
 st.success("✅ Done. Only 'Topical cluster' values were updated; headers/order unchanged.")
 
-# Diagnostics: hub distribution
+# ──────────────────────────────────────────────────────────────────────
+# Diagnostics
+# ──────────────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Hub distribution (top 25)")
-dist = pd.Series([assigned_map.get(c, "Misc") for c in cluster_names]).value_counts().head(25).reset_index()
-dist.columns = ["Topical cluster", "Clusters"]
-st.dataframe(dist, use_container_width=True)
+st.subheader("Diagnostics")
+sizes_list = sorted([(hub_titles[label_map[lab]], len(nodes)) for lab, nodes in label_to_nodes.items()],
+                    key=lambda x: x[1], reverse=True)
+diag = pd.DataFrame(sizes_list, columns=["Topical cluster", "Clusters"])
+st.write(f"Hubs: {len(diag):,}")
+st.dataframe(diag.head(30), use_container_width=True)
+
 
 
 
