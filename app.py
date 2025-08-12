@@ -80,7 +80,8 @@ CONF_THRESH = {"Soft": 0.45, "Medium": 0.60, "Hard": 0.72}
 SIM_FLOOR   = {"Soft": 0.78, "Medium": 0.82, "Hard": 0.86}
 conf_floor  = CONF_THRESH[strictness]
 sim_floor   = SIM_FLOOR[strictness]
-use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", value=True)
+use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", value=True,
+                                           help="Helps prevent obviously wrong matches. Disable if summaries are too minimal.")
 
 # Parallelism & retries
 max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48, 1)
@@ -237,7 +238,16 @@ def call_openai_json(prompt: str, max_tokens: int = 1200, temperature: float = 0
                 except Exception:
                     pass
         raise ValueError("Could not parse JSON from LLM response.")
-# --- strict JSON caller (stronger than call_openai_json) ---
+
+# ── Consolidation helpers must come AFTER embed_texts_cached ─────────
+BANNED_LABELS = ["AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"]
+
+def hub_signature(h: Dict[str, Any]) -> str:
+    title = h.get("title", "").strip()
+    accepts = ", ".join(h.get("accepts", [])[:12])
+    return f"{title} — {accepts}"
+
+# strict JSON caller for large/fragile prompts
 def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, retries: int = 4) -> dict:
     def _ask(p: str, json_mode: bool) -> str:
         kwargs = dict(
@@ -278,131 +288,6 @@ def call_openai_json_strict(prompt: str, max_tokens: int, temperature: float, re
                 except Exception:
                     pass
         raise ValueError("Could not parse JSON from LLM response.")
-
-# --- pick at most K hubs maximizing diversity (no k-means needed) ---
-def pick_diverse_hubs(hubs: List[Dict[str,Any]], k: int) -> List[Dict[str,Any]]:
-    if len(hubs) <= k:
-        return hubs
-    sigs = [hub_signature(h) for h in hubs]
-    V = embed_texts_cached(tuple(sigs))
-    V = normalize(V, axis=1)
-    # Start with the shortest title (usually cleanest)
-    start = int(np.argmin([len(h.get("title","")) for h in hubs]))
-    chosen = [start]
-    # Farthest-point sampling
-    sims = V @ V[start].reshape(-1,1)
-    min_sim = sims.ravel()
-    while len(chosen) < k:
-        idx = int(np.argmin(min_sim))
-        chosen.append(idx)
-        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1,1)).ravel())
-    chosen = sorted(set(chosen))
-    return [hubs[i] for i in chosen]
-
-# ──────────────────────────────────────────────────────────────────────
-# Prompts
-# ──────────────────────────────────────────────────────────────────────
-BANNED_LABELS = ["AI Education Hub", "A Level", "A-Level", "Misc", "General", "Education", "Academics"]
-
-def taxonomy_prompt(sample_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    examples = """
-Good hub titles (2–4 words):
-- Undergraduate Business Degrees
-- Online Psychology Courses
-- MBA & Executive Management
-- Law & Criminology (UK)
-- Computing & IT Degrees
-
-Forbidden titles (too generic):
-- AI Education Hub
-- A Level
-- Misc
-- Education
-- General
-""".strip()
-
-    return f"""
-Design a two-tier site taxonomy (list of hubs) solely from the following cluster summaries.
-Respond with strict JSON:
-{{
-  "hubs": [
-    {{
-      "id": "UG_BUSINESS",
-      "title": "Undergraduate Business Degrees",
-      "parent_id": null,
-      "accepts": ["business","management","ba","bsc","undergraduate"],
-      "avoid":   ["mba","postgraduate","fees"]
-    }}
-  ],
-  "constraints": {{"max_hubs": {max_hubs_param}, "max_depth": 2}}
-}}
-
-Rules:
-- 60–{max_hubs_param} hubs, 2–4 word Title Case names.
-- Avoid banned titles: {", ".join(BANNED_LABELS)}.
-- Keep consistent level/mode/geo only if common across items.
-- Favor hubs that align to user navigation; keep granularity consistent across hubs.
-- IDs must be uppercase (A–Z, 0–9, underscores), unique and stable.
-- Include short 'accepts' terms that characterize the hub; include 'avoid' for common confusions.
-- Keep depth at most 2 (parent/child). Parent hubs optional.
-
-Cluster summaries (sample):
-{json.dumps(sample_items, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def shard_taxonomy_prompt(shard_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    return f"""
-Design a list of up to {max_hubs_param} specific hubs for a university website, from ONLY the following cluster summaries (subset/shard).
-Return JSON:
-{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-
-Rules:
-- 2–4 word Title Case titles; avoid: {", ".join(BANNED_LABELS)}.
-- Keep consistent level/mode/geo only if common in this shard.
-- IDs uppercase underscore, unique within this shard.
-
-Shard cluster summaries:
-{json.dumps(shard_items, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def consolidate_taxonomy_prompt(hubs: List[Dict[str, Any]], max_hubs_param: int) -> str:
-    return f"""
-You are consolidating hub candidates (may contain near-duplicates). Merge synonyms into single hubs.
-Return JSON:
-{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-
-Rules:
-- Keep 60–{max_hubs_param} total; prefer the clearest, navigational title.
-- Merge close titles (synonyms), union their 'accepts', intersect obvious 'avoid'.
-- Avoid banned titles: {", ".join(BANNED_LABELS)}.
-- Ensure unique IDs and titles.
-
-Candidates:
-{json.dumps(hubs, ensure_ascii=False, indent=2)}
-
-Return JSON only.
-""".strip()
-
-def gapfill_taxonomy_prompt(problem_items: List[Dict[str, Any]], max_new: int) -> str:
-    return f"""
-Propose up to {max_new} NEW hubs to cover the following uncovered/low-confidence clusters.
-Return JSON: {{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
-Clusters:
-{json.dumps(problem_items, ensure_ascii=False, indent=2)}
-Return JSON only.
-""".strip()
-
-# ──────────────────────────────────────────────────────────────────────
-# Consolidation utilities (embedding-based)
-# ──────────────────────────────────────────────────────────────────────
-def hub_signature(h: Dict[str, Any]) -> str:
-    title = h.get("title", "").strip()
-    accepts = ", ".join(h.get("accepts", [])[:12])
-    return f"{title} — {accepts}"
 
 def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: float) -> List[Dict[str, Any]]:
     if not hubs:
@@ -461,6 +346,103 @@ def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: fl
         merged.append({"id": tid, "title": best_title, "parent_id": None, "accepts": accepts, "avoid": avoid})
     return merged
 
+def pick_diverse_hubs(hubs: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    if len(hubs) <= k:
+        return hubs
+    sigs = [hub_signature(h) for h in hubs]
+    V = embed_texts_cached(tuple(sigs))
+    V = normalize(V, axis=1)
+    # Start with the shortest title (usually cleanest)
+    start = int(np.argmin([len(h.get("title", "")) for h in hubs]))
+    chosen = [start]
+    sims = V @ V[start].reshape(-1, 1)
+    min_sim = sims.ravel()
+    while len(chosen) < k:
+        idx = int(np.argmin(min_sim))
+        chosen.append(idx)
+        min_sim = np.minimum(min_sim, (V @ V[idx].reshape(-1, 1)).ravel())
+    chosen = sorted(set(chosen))
+    return [hubs[i] for i in chosen]
+
+# ──────────────────────────────────────────────────────────────────────
+# Prompts
+# ──────────────────────────────────────────────────────────────────────
+def taxonomy_prompt(sample_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
+    return f"""
+Design a two-tier site taxonomy (list of hubs) solely from the following cluster summaries.
+Respond with strict JSON:
+{{
+  "hubs": [
+    {{
+      "id": "UG_BUSINESS",
+      "title": "Undergraduate Business Degrees",
+      "parent_id": null,
+      "accepts": ["business","management","ba","bsc","undergraduate"],
+      "avoid":   ["mba","postgraduate","fees"]
+    }}
+  ],
+  "constraints": {{"max_hubs": {max_hubs_param}, "max_depth": 2}}
+}}
+
+Rules:
+- 60–{max_hubs_param} hubs, 2–4 word Title Case names.
+- Avoid banned titles: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
+- Keep consistent level/mode/geo only if common across items.
+- Favor hubs that align to user navigation; keep granularity consistent across hubs.
+- IDs must be uppercase (A–Z, 0–9, underscores), unique and stable.
+- Include short 'accepts' terms that characterize the hub; include 'avoid' for common confusions.
+- Keep depth at most 2 (parent/child). Parent hubs optional.
+
+Cluster summaries (sample):
+{json.dumps(sample_items, ensure_ascii=False, indent=2)}
+
+Return JSON only.
+""".strip()
+
+def shard_taxonomy_prompt(shard_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
+    return f"""
+Design a list of up to {max_hubs_param} specific hubs for a university website, from ONLY the following cluster summaries (subset/shard).
+Return JSON:
+{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
+
+Rules:
+- 2–4 word Title Case titles; avoid: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
+- Keep consistent level/mode/geo only if common in this shard.
+- IDs uppercase underscore, unique within this shard.
+
+Shard cluster summaries:
+{json.dumps(shard_items, ensure_ascii=False, indent=2)}
+
+Return JSON only.
+""".strip()
+
+def consolidate_taxonomy_prompt(hubs: List[Dict[str, Any]], max_hubs_param: int) -> str:
+    return f"""
+You are consolidating hub candidates (may contain near-duplicates). Merge synonyms into single hubs.
+Return JSON:
+{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
+
+Rules:
+- Keep 60–{max_hubs_param} total; prefer the clearest, navigational title.
+- Merge close titles (synonyms), union their 'accepts', intersect obvious 'avoid'.
+- Avoid banned titles: AI Education Hub, A Level, A-Level, Misc, General, Education, Academics.
+- Ensure unique IDs and titles.
+
+Candidates:
+{json.dumps(hubs, ensure_ascii=False, indent=2)}
+
+Return JSON only.
+""".strip()
+
+def gapfill_taxonomy_prompt(problem_items: List[Dict[str, Any]], max_new: int) -> str:
+    return f"""
+Propose up to {max_new} NEW hubs to cover the following uncovered/low-confidence clusters.
+Return JSON: {{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
+Clusters:
+{json.dumps(problem_items, ensure_ascii=False, indent=2)}
+Return JSON only.
+""".strip()
+
 # ──────────────────────────────────────────────────────────────────────
 # Upload CSV
 # ──────────────────────────────────────────────────────────────────────
@@ -510,65 +492,85 @@ if use_map_reduce:
     all_items_sorted = sorted(all_items, key=lambda x: x["total_search_volume"], reverse=True)
     shards = [all_items_sorted[i:i + shard_size] for i in range(0, len(all_items_sorted), shard_size)]
 
+    bad_shards = []
     per_shard_hubs = []
+
+    # Robust shard runner with char budget + strict JSON
+    def run_shard(shard_idx: int, shard: list) -> dict:
+        char_budget = 70_000  # keep prompts reasonable
+        s_items, chars = [], 0
+        for it in shard:
+            t = len(it["summary"])
+            if chars + t > char_budget:
+                break
+            s_items.append(it)
+            chars += t
+        prompt = shard_taxonomy_prompt(s_items, max_hubs_param=hubs_per_shard)
+        try:
+            return call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
+        except Exception as e:
+            bad_shards.append({"shard_index": shard_idx, "error": str(e), "count": len(s_items)})
+            raise
+
     progress = st.progress(0.0)
-
-    def run_shard(shard):
-        prompt = shard_taxonomy_prompt(shard, max_hubs_param=hubs_per_shard)
-        return call_openai_json(prompt, max_tokens=1700, temperature=temperature)
-
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(run_shard, s): idx for idx, s in enumerate(shards)}
+        futures = {ex.submit(run_shard, i, s): i for i, s in enumerate(shards)}
         done = 0
         for fut in as_completed(futures):
+            idx = futures[fut]
             done += 1
             try:
                 out = fut.result()
                 per_shard_hubs.extend(out.get("hubs", []))
-            except Exception as e:
-                st.warning(f"Shard {futures[fut]} failed: {e}")
+            except Exception:
+                st.warning(f"Shard {idx} failed: Could not parse JSON from LLM response.")
             progress.progress(done / len(shards))
     progress.empty()
+
+    if bad_shards:
+        bad_df = pd.DataFrame(bad_shards)
+        st.download_button("⬇️ Download failed shard report", bad_df.to_csv(index=False),
+                           "failed_shards.csv", "text/csv")
 
     st.caption("Consolidating shard hubs by semantic similarity…")
     consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim)
 
     st.caption("LLM consolidation of merged hubs (chunked, robust)…")
 
-# 1) Pre-trim each candidate for compact JSON
-def _trim(h):
-    return {
-        "id": str(h.get("id",""))[:80],
-        "title": str(h.get("title",""))[:80],
-        "parent_id": h.get("parent_id", None),
-        "accepts": [a for a in h.get("accepts", []) if isinstance(a,str)][:12],
-        "avoid":   [a for a in h.get("avoid",   []) if isinstance(a,str)][:12],
-    }
-candidates = [_trim(h) for h in consolidated]
+    # 1) Pre-trim each candidate for compact JSON
+    def _trim(h):
+        return {
+            "id": str(h.get("id", ""))[:80],
+            "title": str(h.get("title", ""))[:80],
+            "parent_id": h.get("parent_id", None),
+            "accepts": [a for a in h.get("accepts", []) if isinstance(a, str)][:12],
+            "avoid":   [a for a in h.get("avoid",   []) if isinstance(a, str)][:12],
+        }
 
-# 2) Chunk candidates to avoid oversized prompts
-chunk_size = 280  # ~safe with 1700 tokens
-chunks = [candidates[i:i+chunk_size] for i in range(0, len(candidates), chunk_size)]
+    candidates = [_trim(h) for h in consolidated]
 
-merged_parts = []
-for idx, ch in enumerate(chunks, 1):
-    prompt = consolidate_taxonomy_prompt(ch, max_hubs_param=min(max_hubs, hubs_per_shard*2))
-    try:
-        out = call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
-        merged_parts.extend(out.get("hubs", []))
-    except Exception as e:
-        st.warning(f"Consolidation chunk {idx} failed; falling back to candidates unchanged for this chunk.")
-        merged_parts.extend(ch)
+    # 2) Chunk candidates to avoid oversized prompts
+    chunk_size = 280  # ~safe with 1700 tokens
+    chunks = [candidates[i:i + chunk_size] for i in range(0, len(candidates), chunk_size)]
 
-# 3) Embedding consolidation over all merged parts
-merged_once = consolidate_hubs_by_similarity(merged_parts, consolidation_sim)
+    merged_parts = []
+    for idx, ch in enumerate(chunks, 1):
+        prompt = consolidate_taxonomy_prompt(ch, max_hubs_param=min(max_hubs, hubs_per_shard * 2))
+        try:
+            out = call_openai_json_strict(prompt, max_tokens=1700, temperature=temperature)
+            merged_parts.extend(out.get("hubs", []))
+        except Exception:
+            st.warning(f"Consolidation chunk {idx} failed; falling back to candidates unchanged for this chunk.")
+            merged_parts.extend(ch)
 
-# 4) Final cap to max_hubs:
-if len(merged_once) > max_hubs:
-    hubs_list = pick_diverse_hubs(merged_once, max_hubs)
-else:
-    hubs_list = merged_once
+    # 3) Embedding consolidation over all merged parts
+    merged_once = consolidate_hubs_by_similarity(merged_parts, consolidation_sim)
 
+    # 4) Final cap to max_hubs:
+    if len(merged_once) > max_hubs:
+        hubs_list = pick_diverse_hubs(merged_once, max_hubs)
+    else:
+        hubs_list = merged_once
 
 else:
     # Legacy single-shot sample (optional)
@@ -576,6 +578,7 @@ else:
     sample = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(v)}
               for c, v in sorted_clusters[:sample_top_n]]
 
+    # Trim if too long
     if len(sample) > 0:
         total_chars = sum(len(s["summary"]) for s in sample)
         if total_chars > 180_000:
@@ -842,6 +845,7 @@ st.subheader("Hub distribution (top 25)")
 dist = pd.Series([assigned_map.get(c, "Misc") for c in cluster_names]).value_counts().head(25).reset_index()
 dist.columns = ["Topical cluster", "Clusters"]
 st.dataframe(dist, use_container_width=True)
+
 
 
 
