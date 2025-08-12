@@ -1,11 +1,11 @@
 # app.py
-# Topical Hubs (LLM IA, clusters-only)
-# - Builds a taxonomy (hubs) from your clusters (sampled), then assigns all clusters.
+# Topical Hubs (LLM IA, clusters-only) with Map-Reduce taxonomy, consolidation, and gap-fill.
+# - Builds a taxonomy (hubs) from ALL clusters via shards, consolidates, then assigns every cluster.
 # - Preserves exact CSV headers & order. Overwrites only the values in "Topical cluster".
 #
 # Requirements:
 # - Streamlit secrets configured for Vertex + OpenAI:
-#   st.secrets["vertex_ai"] (service account), st.secrets["openai"]["api_key"]
+#   st.secrets["vertex_ai"] (service account dict), st.secrets["openai"]["api_key"]
 # - CSV must contain: Keyword, Search volume, Cluster, Topical cluster (others preserved)
 
 import os
@@ -32,7 +32,7 @@ from google.genai.types import EmbedContentConfig
 # ──────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Topical Hubs (LLM IA, clusters-only)", page_icon="🧭", layout="wide")
 st.title("🧭 Build Topical Hubs (LLM IA, clusters-only)")
-st.caption("Generates a clean hub taxonomy from your clusters and assigns each cluster. Only 'Topical cluster' values are changed; all other headers & order preserved.")
+st.caption("Generates a hub taxonomy from your clusters (map-reduce) and assigns each cluster. Only 'Topical cluster' values are changed; headers/order preserved.")
 
 # ──────────────────────────────────────────────────────────────────────
 # Credentials (Vertex + OpenAI)
@@ -59,14 +59,18 @@ openai_client = OpenAI()
 # ──────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 Settings")
 
-sample_top_n = st.sidebar.slider(
-    "Clusters used to design taxonomy (by volume)",
-    300, 2000, 1000, 50,
-    help="Use a larger sample (e.g., 1500–2000) for more hubs; smaller runs faster."
-)
+# Map-Reduce taxonomy controls
+use_map_reduce       = st.sidebar.checkbox("Use map-reduce taxonomy (cover all clusters)", value=True)
+shard_size           = st.sidebar.slider("Shard size (clusters per shard)", 600, 1500, 1000, 50)
+hubs_per_shard       = st.sidebar.slider("Max hubs per shard", 20, 80, 50, 5)
+consolidation_sim    = st.sidebar.slider("Consolidation similarity (hub title+accepts)", 0.86, 0.98, 0.91, 0.01)
+gapfill_max_new_hubs = st.sidebar.slider("Gap-fill: max extra hubs", 10, 100, 40, 5)
+
+# Legacy single-shot sampling (optional)
+sample_top_n = st.sidebar.slider("Clusters used to design taxonomy (legacy single-shot)", 300, 2000, 1000, 50)
 
 # Max hubs & regen/debug controls
-max_hubs = st.sidebar.slider("Max hubs in taxonomy", 60, 250, 150, 10)
+max_hubs = st.sidebar.slider("Max hubs in final taxonomy", 60, 250, 150, 10)
 regenerate_taxonomy = st.sidebar.button("🔄 Regenerate taxonomy (ignore cache)")
 show_raw_taxonomy   = st.sidebar.checkbox("Show raw taxonomy response (debug)", value=False)
 
@@ -76,9 +80,7 @@ CONF_THRESH = {"Soft": 0.45, "Medium": 0.60, "Hard": 0.72}
 SIM_FLOOR   = {"Soft": 0.78, "Medium": 0.82, "Hard": 0.86}
 conf_floor  = CONF_THRESH[strictness]
 sim_floor   = SIM_FLOOR[strictness]
-
-use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", value=True,
-                                           help="Helps prevent obviously wrong matches. Disable if summaries are too minimal.")
+use_similarity_guard = st.sidebar.checkbox("Use embedding similarity guard", value=True)
 
 # Parallelism & retries
 max_workers_assign = st.sidebar.slider("Parallel assignment workers", 1, 96, 48, 1)
@@ -112,7 +114,7 @@ if st.sidebar.button("🗑️ Reset caches (taxonomy, assignments, embeddings)")
     st.success("Caches cleared. Regenerate the taxonomy and re-run assignment.")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Tip: If you see too many 'Misc', lower strictness or increase sample/max hubs, then Regenerate taxonomy.")
+st.sidebar.caption("Tip: If you see too many 'Misc', lower strictness or increase hubs/shard size, then Regenerate taxonomy.")
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers: hashing, caching, embeddings, prompts, retrying
@@ -289,27 +291,114 @@ Cluster summaries (sample):
 Return JSON only.
 """.strip()
 
-def assign_prompt(cluster_name: str, summary: str, hubs_json: Dict[str, Any], strictness_text: str) -> str:
+def shard_taxonomy_prompt(shard_items: List[Dict[str, Any]], max_hubs_param: int) -> str:
     return f"""
-You assign content clusters to site hubs.
-
-Strictness: {strictness_text}. Choose the best hub for the cluster below.
-Return strictly this JSON:
-{{"best":"HUB_ID","confidence":0.00,"alts":[["ALT_ID",0.00],["ALT2_ID",0.00]]}}
+Design a list of up to {max_hubs_param} specific hubs for a university website, from ONLY the following cluster summaries (subset/shard).
+Return JSON:
+{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
 
 Rules:
-- Prefer hubs whose 'accepts' fit and 'avoid' do not match.
-- Keep level/mode/geo if present in the cluster summary.
-- Be conservative: if uncertain, lower confidence.
-- No commentary.
+- 2–4 word Title Case titles; avoid: {", ".join(BANNED_LABELS)}.
+- Keep consistent level/mode/geo only if common in this shard.
+- IDs uppercase underscore, unique within this shard.
 
-Hubs JSON:
-{json.dumps(hubs_json, ensure_ascii=False)}
+Shard cluster summaries:
+{json.dumps(shard_items, ensure_ascii=False, indent=2)}
 
-Cluster:
-- name: {cluster_name}
-- summary: {summary}
+Return JSON only.
 """.strip()
+
+def consolidate_taxonomy_prompt(hubs: List[Dict[str, Any]], max_hubs_param: int) -> str:
+    return f"""
+You are consolidating hub candidates (may contain near-duplicates). Merge synonyms into single hubs.
+Return JSON:
+{{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
+
+Rules:
+- Keep 60–{max_hubs_param} total; prefer the clearest, navigational title.
+- Merge close titles (synonyms), union their 'accepts', intersect obvious 'avoid'.
+- Avoid banned titles: {", ".join(BANNED_LABELS)}.
+- Ensure unique IDs and titles.
+
+Candidates:
+{json.dumps(hubs, ensure_ascii=False, indent=2)}
+
+Return JSON only.
+""".strip()
+
+def gapfill_taxonomy_prompt(problem_items: List[Dict[str, Any]], max_new: int) -> str:
+    return f"""
+Propose up to {max_new} NEW hubs to cover the following uncovered/low-confidence clusters.
+Return JSON: {{"hubs":[{{"id":"...","title":"...","parent_id":null,"accepts":["..."],"avoid":["..."]}}]}}
+Clusters:
+{json.dumps(problem_items, ensure_ascii=False, indent=2)}
+Return JSON only.
+""".strip()
+
+# ──────────────────────────────────────────────────────────────────────
+# Consolidation utilities (embedding-based)
+# ──────────────────────────────────────────────────────────────────────
+def hub_signature(h: Dict[str, Any]) -> str:
+    title = h.get("title", "").strip()
+    accepts = ", ".join(h.get("accepts", [])[:12])
+    return f"{title} — {accepts}"
+
+def consolidate_hubs_by_similarity(hubs: List[Dict[str, Any]], sim_threshold: float) -> List[Dict[str, Any]]:
+    if not hubs:
+        return hubs
+    texts = [hub_signature(h) for h in hubs]
+    V = embed_texts_cached(tuple(texts))
+    V = normalize(V, axis=1)
+    n = V.shape[0]
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    blk = 1024
+    for i0 in range(0, n, blk):
+        A = V[i0:i0 + blk]
+        for j0 in range(i0, n, blk):
+            B = V[j0:j0 + blk]
+            S = A @ B.T
+            ai, aj = np.where(S >= sim_threshold)
+            for k in range(len(ai)):
+                i = i0 + ai[k]
+                j = j0 + aj[k]
+                if i < j:
+                    union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    merged = []
+    seen_titles = set()
+    for root, idxs in groups.items():
+        members = [hubs[i] for i in idxs]
+        titles = [m.get("title", "").strip() for m in members if m.get("title")]
+        best_title = sorted(titles, key=len)[0] if titles else "Topic"
+        accepts, avoid = [], []
+        for m in members:
+            accepts.extend([a for a in m.get("accepts", []) if isinstance(a, str)])
+            avoid.extend([a for a in m.get("avoid", []) if isinstance(a, str)])
+        accepts = sorted(set(accepts))[:30]
+        avoid = sorted(set(avoid))[:30]
+        tid = best_title.upper().replace(" ", "_")
+        tid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in tid)
+        if best_title.lower() in seen_titles:
+            tid = tid + "_" + hashlib.md5(best_title.encode()).hexdigest()[:6].upper()
+        seen_titles.add(best_title.lower())
+        merged.append({"id": tid, "title": best_title, "parent_id": None, "accepts": accepts, "avoid": avoid})
+    return merged
 
 # ──────────────────────────────────────────────────────────────────────
 # Upload CSV
@@ -349,42 +438,67 @@ for cname, grp in cluster_groups.items():
     cluster_total_vol[str(cname)] = float(vol)
 
 # ──────────────────────────────────────────────────────────────────────
-# Step 2 — Design taxonomy (hubs) from sample clusters
+# Step 2 — Design taxonomy (map-reduce across ALL clusters, or legacy sample)
 # ──────────────────────────────────────────────────────────────────────
-st.subheader("Step 2 — Designing the taxonomy (hubs) from clusters")
+st.subheader("Step 2 — Designing the taxonomy (hubs)")
 
-# Select top-N clusters by total volume
-sorted_clusters = sorted(cluster_total_vol.items(), key=lambda x: x[1], reverse=True)
-sample = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(v)}
-          for c, v in sorted_clusters[:sample_top_n]]
+if use_map_reduce:
+    st.caption("Map-reduce mode: generating per-shard taxonomies across all clusters…")
+    all_items = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(cluster_total_vol[c])}
+                 for c in cluster_summaries.keys()]
+    all_items_sorted = sorted(all_items, key=lambda x: x["total_search_volume"], reverse=True)
+    shards = [all_items_sorted[i:i + shard_size] for i in range(0, len(all_items_sorted), shard_size)]
 
-# Token-safety: rough guard to avoid overly long prompts → truncated JSON
-if len(sample) > 0:
-    total_chars = sum(len(s["summary"]) for s in sample)
-    if total_chars > 180_000:
-        keep = max(400, int(180_000 / (total_chars / len(sample))))
-        sample = sample[:keep]
-        st.warning(f"Large sample trimmed to {keep} items to ensure valid JSON output.")
+    per_shard_hubs = []
+    progress = st.progress(0.0)
 
-@st.cache_data(show_spinner=False)
-def _compute_taxonomy(file_sig: str, sample_json: str, max_hubs_param: int, t: float) -> Dict[str, Any]:
-    prompt = taxonomy_prompt(json.loads(sample_json), max_hubs_param=max_hubs_param)
-    ia = call_openai_json(prompt, max_tokens=2000, temperature=t)
-    return ia
+    def run_shard(shard):
+        prompt = shard_taxonomy_prompt(shard, max_hubs_param=hubs_per_shard)
+        return call_openai_json(prompt, max_tokens=1700, temperature=temperature)
 
-file_sig = file_hash_bytes(csv_bytes) + f"|sample={len(sample)}|maxh={max_hubs}|t={temperature}"
-sample_json = json.dumps(sample, ensure_ascii=False)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(run_shard, s): idx for idx, s in enumerate(shards)}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                out = fut.result()
+                per_shard_hubs.extend(out.get("hubs", []))
+            except Exception as e:
+                st.warning(f"Shard {futures[fut]} failed: {e}")
+            progress.progress(done / len(shards))
+    progress.empty()
 
-if regenerate_taxonomy:
-    _compute_taxonomy.clear()
+    st.caption("Consolidating shard hubs by semantic similarity…")
+    consolidated = consolidate_hubs_by_similarity(per_shard_hubs, consolidation_sim)
 
-ia_raw = _compute_taxonomy(file_sig, sample_json, max_hubs, temperature)
+    st.caption("LLM consolidation of merged hubs (cap to max hubs)…")
+    llm_consolidated = call_openai_json(
+        consolidate_taxonomy_prompt(consolidated, max_hubs_param=max_hubs),
+        max_tokens=1800, temperature=temperature
+    )
+    hubs_list = llm_consolidated.get("hubs", [])
 
-# Basic validation & cleanup
-hubs = ia_raw.get("hubs", [])
+else:
+    # Legacy single-shot sample (optional)
+    sorted_clusters = sorted(cluster_total_vol.items(), key=lambda x: x[1], reverse=True)
+    sample = [{"cluster": c, "summary": cluster_summaries[c], "total_search_volume": int(v)}
+              for c, v in sorted_clusters[:sample_top_n]]
+
+    if len(sample) > 0:
+        total_chars = sum(len(s["summary"]) for s in sample)
+        if total_chars > 180_000:
+            keep = max(400, int(180_000 / (total_chars / len(sample))))
+            sample = sample[:keep]
+            st.warning(f"Large sample trimmed to {keep} items to ensure valid JSON output.")
+
+    ia_raw = call_openai_json(taxonomy_prompt(sample, max_hubs_param=max_hubs), max_tokens=2000, temperature=temperature)
+    hubs_list = ia_raw.get("hubs", [])
+
+# Cleanup & validate hubs_list
 seen_ids, seen_titles = set(), set()
 cleaned_hubs = []
-for h in hubs:
+for h in hubs_list:
     hid = str(h.get("id", "")).upper().strip().replace(" ", "_")
     hid = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in hid)
     title = str(h.get("title", "")).strip()
@@ -392,7 +506,7 @@ for h in hubs:
         continue
     if hid in seen_ids or title.lower() in seen_titles:
         continue
-    if title in {"Misc","General","Education","AI Education Hub","A Level","A-Level"}:
+    if title in {"Misc", "General", "Education", "AI Education Hub", "A Level", "A-Level"}:
         continue
     seen_ids.add(hid); seen_titles.add(title.lower())
     cleaned_hubs.append({
@@ -403,36 +517,36 @@ for h in hubs:
         "avoid":   [a for a in h.get("avoid",   [])[:20] if isinstance(a, str)],
     })
 
-ia = {"hubs": cleaned_hubs, "constraints": ia_raw.get("constraints", {"max_hubs": max_hubs, "max_depth": 2})}
-
 if show_raw_taxonomy:
-    st.code(json.dumps(ia_raw, ensure_ascii=False, indent=2)[:4000], language="json")
+    try:
+        st.code(json.dumps({"hubs": hubs_list}, ensure_ascii=False, indent=2)[:4000], language="json")
+    except Exception:
+        pass
 
+if not cleaned_hubs:
+    st.error("No hubs generated. Loosen settings or disable map-reduce temporarily.")
+    st.stop()
+
+ia = {"hubs": cleaned_hubs, "constraints": {"max_hubs": max_hubs, "max_depth": 2}}
 st.caption("Review/edit the generated taxonomy (optional).")
 ia_text = st.text_area("Taxonomy JSON", json.dumps(ia, ensure_ascii=False, indent=2), height=320)
 try:
     ia = json.loads(ia_text)
-    hubs_list: List[Dict[str, Any]] = ia.get("hubs", [])
+    hubs_list = ia.get("hubs", [])
 except Exception as e:
     st.error(f"Invalid JSON in taxonomy editor: {e}")
     st.stop()
 
 if not hubs_list:
-    st.error("No hubs were generated. Increase sample size or max hubs and regenerate.")
+    st.error("No hubs after editing.")
     st.stop()
 
-# Build maps for hub metadata
+# Build maps for hub metadata & embed for similarity guard
 hub_id_to_title  = {h["id"]: h["title"] for h in hubs_list}
 hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
-
-# Hub summaries for similarity guard
 hub_summaries = [f'{h["title"]} — ' + ", ".join([t for t in h.get("accepts", []) if isinstance(t, str)]) for h in hubs_list]
-hub_ids_ordered    = [h["id"] for h in hubs_list]
-hub_titles_ordered = [h["title"] for h in hubs_list]
-
-st.caption("Embedding hub summaries for assignment sanity checks…")
-hub_vecs = embed_texts_cached(tuple(hub_summaries))
-hub_vecs = normalize(hub_vecs, axis=1)
+hub_ids_ordered = [h["id"] for h in hubs_list]
+hub_vecs = normalize(embed_texts_cached(tuple(hub_summaries)), axis=1)
 
 # ──────────────────────────────────────────────────────────────────────
 # Step 3 — Assign each cluster to best hub (parallel, cached, similarity guard)
@@ -460,13 +574,13 @@ def choose_with_similarity_guard(cluster_vec: np.ndarray, best_id: str, alt_ids:
     sims: List[Tuple[str, float]] = []
     try:
         i = hub_ids_ordered.index(best_id)
-        sims.append((best_id, float((cluster_vec @ hub_vecs[i].reshape(-1,1)).ravel()[0])))
+        sims.append((best_id, float((cluster_vec @ hub_vecs[i].reshape(-1, 1)).ravel()[0])))
     except ValueError:
         pass
     for aid in alt_ids[:3]:
         try:
             j = hub_ids_ordered.index(aid)
-            sims.append((aid, float((cluster_vec @ hub_vecs[j].reshape(-1,1)).ravel()[0])))
+            sims.append((aid, float((cluster_vec @ hub_vecs[j].reshape(-1, 1)).ravel()[0])))
         except ValueError:
             continue
     sims_sorted = sorted(sims, key=lambda x: (x[0] != best_id, -x[1]))  # prefer best_id then higher sim
@@ -474,6 +588,28 @@ def choose_with_similarity_guard(cluster_vec: np.ndarray, best_id: str, alt_ids:
         if sim >= sim_floor:
             return hid
     return best_id
+
+def assign_prompt(cluster_name: str, summary: str, hubs_json: Dict[str, Any], strictness_text: str) -> str:
+    return f"""
+You assign content clusters to site hubs.
+
+Strictness: {strictness_text}. Choose the best hub for the cluster below.
+Return strictly this JSON:
+{{"best":"HUB_ID","confidence":0.00,"alts":[["ALT_ID",0.00],["ALT2_ID",0.00]]}}
+
+Rules:
+- Prefer hubs whose 'accepts' fit and 'avoid' do not match.
+- Keep level/mode/geo if present in the cluster summary.
+- Be conservative: if uncertain, lower confidence.
+- No commentary.
+
+Hubs JSON:
+{json.dumps(hubs_json, ensure_ascii=False)}
+
+Cluster:
+- name: {cluster_name}
+- summary: {summary}
+""".strip()
 
 def assign_one(cluster_name: str, summary: str) -> Dict[str, Any]:
     key = assignment_key(cluster_name, summary)
@@ -488,12 +624,10 @@ def assign_one(cluster_name: str, summary: str) -> Dict[str, Any]:
     alts = result.get("alts", [])
     alt_ids = [a[0] for a in alts if isinstance(a, list) and a and isinstance(a[0], str)]
 
-    # Confidence handling
     chosen = best
     if confidence < conf_floor:
         chosen = fallback_parent(best)
 
-    # Similarity guard
     try:
         cvec = embed_cluster_summary(summary)
         chosen = choose_with_similarity_guard(cvec, chosen, alt_ids)
@@ -504,7 +638,6 @@ def assign_one(cluster_name: str, summary: str) -> Dict[str, Any]:
     assign_cache[key] = out
     return out
 
-# Parallel assignment with progress
 cluster_names = list(cluster_summaries.keys())
 cluster_summary_list = [cluster_summaries[c] for c in cluster_names]
 
@@ -537,11 +670,47 @@ with ThreadPoolExecutor(max_workers=max_workers_assign) as ex:
 progress.empty()
 status.empty()
 
-# Optional: export assignment issues (helps debug "Misc"/failures)
+# ──────────────────────────────────────────────────────────────────────
+# Step 3b — Gap-fill (optional): propose extra hubs for low-confidence/Misc and reassign
+# ──────────────────────────────────────────────────────────────────────
+low_conf_or_misc = []
+for cname, res in results_log:
+    conf = (res or {}).get("confidence", 0.0) if isinstance(res, dict) else 0.0
+    chosen_title = assigned_map.get(cname, "Misc")
+    if (conf < (conf_floor - 0.1)) or (chosen_title == "Misc"):
+        low_conf_or_misc.append({"cluster": cname, "summary": cluster_summaries[cname]})
+
+if low_conf_or_misc and gapfill_max_new_hubs > 0:
+    st.caption(f"Gap-fill: proposing up to {gapfill_max_new_hubs} extra hubs for uncovered themes…")
+    extra = call_openai_json(
+        gapfill_taxonomy_prompt(low_conf_or_misc[:1200], gapfill_max_new_hubs),
+        max_tokens=1200, temperature=temperature
+    )
+    extra_hubs = extra.get("hubs", [])
+    if extra_hubs:
+        merged = consolidate_hubs_by_similarity(hubs_list + extra_hubs, consolidation_sim)
+        # Rebuild maps
+        hubs_list = merged
+        hub_id_to_title  = {h["id"]: h["title"] for h in hubs_list}
+        hub_id_to_parent = {h["id"]: h.get("parent_id") for h in hubs_list}
+        hub_summaries = [hub_signature(h) for h in hubs_list]
+        hub_ids_ordered = [h["id"] for h in hubs_list]
+        hub_vecs = normalize(embed_texts_cached(tuple(hub_summaries)), axis=1)
+
+        def reassign_one(cname):
+            res = assign_one(cname, cluster_summaries[cname])
+            hid = res.get("chosen") or res.get("best")
+            return cname, hub_id_to_title.get(hid, "Misc")
+
+        with ThreadPoolExecutor(max_workers=max_workers_assign) as ex:
+            for cname, title in ex.map(reassign_one, [x["cluster"] for x in low_conf_or_misc]):
+                assigned_map[cname] = title
+
+# Optional: export assignment issues
 issues = []
 for cname, res in results_log:
     if isinstance(res, dict):
-        if res.get("chosen") is None or hub_id_to_title.get(res.get("chosen","")) is None:
+        if res.get("chosen") is None or hub_id_to_title.get(res.get("chosen", "")) is None:
             issues.append({
                 "cluster": cname,
                 "reason": "no chosen id or id not in taxonomy",
@@ -582,6 +751,7 @@ st.subheader("Hub distribution (top 25)")
 dist = pd.Series([assigned_map.get(c, "Misc") for c in cluster_names]).value_counts().head(25).reset_index()
 dist.columns = ["Topical cluster", "Clusters"]
 st.dataframe(dist, use_container_width=True)
+
 
 
 
