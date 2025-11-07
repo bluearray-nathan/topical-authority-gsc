@@ -76,9 +76,7 @@ k_neighbors = st.sidebar.slider("k-NN neighbors per node (k)", 5, 50, 25, 1,
 min_hub_size = st.sidebar.slider("Min hub size (merge tiny groups to nearest hub)", 1, 10, 2, 1)
 
 # Embedding summary options
-# Removed slider for "Keywords per cluster used in summaries".
-# Hard-code to keep summaries strong and stable.
-MAX_KEYWORDS_FOR_SUMMARY = 12
+max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
 stop_default = "guide,hub,near me"
 stop_tokens = st.sidebar.text_area("Downweight/remove tokens in summaries (comma-separated)",
                                    value=stop_default, height=70)
@@ -227,8 +225,7 @@ stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
 cluster_names = list(map(str, cluster_groups.keys()))
 
-# Use fixed MAX_KEYWORDS_FOR_SUMMARY (slider removed)
-summaries = [build_cluster_summary(c, cluster_groups[c], stops, MAX_KEYWORDS_FOR_SUMMARY) for c in cluster_names]
+summaries = [build_cluster_summary(c, cluster_groups[c], stops, max_keywords_for_summary) for c in cluster_names]
 
 emb = embed_in_batches(summaries, batch_size=embed_batch_size)
 st.success(f"✅ Embedded {len(cluster_names):,} clusters.")
@@ -430,6 +427,7 @@ sizes_list = sorted([(hub_titles[label_map[lab]], len(nodes)) for lab, nodes in 
 diag = pd.DataFrame(sizes_list, columns=["Topical cluster", "Clusters"])
 st.write(f"Hubs: {len(diag):,}")
 st.dataframe(diag.head(30), use_container_width=True)
+
 
 
 
