@@ -76,7 +76,9 @@ k_neighbors = st.sidebar.slider("k-NN neighbors per node (k)", 5, 50, 25, 1,
 min_hub_size = st.sidebar.slider("Min hub size (merge tiny groups to nearest hub)", 1, 10, 2, 1)
 
 # Embedding summary options
-max_keywords_for_summary = st.sidebar.slider("Keywords per cluster used in summaries", 4, 20, 12, 1)
+# Removed slider for "Keywords per cluster used in summaries".
+# Hard-code to keep summaries strong and stable.
+MAX_KEYWORDS_FOR_SUMMARY = 12
 stop_default = "guide,hub,near me"
 stop_tokens = st.sidebar.text_area("Downweight/remove tokens in summaries (comma-separated)",
                                    value=stop_default, height=70)
@@ -225,7 +227,8 @@ stops = set([t.strip().lower() for t in stop_tokens.split(",") if t.strip()])
 cluster_groups = {name: grp.copy() for name, grp in df.groupby("Cluster", dropna=False)}
 cluster_names = list(map(str, cluster_groups.keys()))
 
-summaries = [build_cluster_summary(c, cluster_groups[c], stops, max_keywords_for_summary) for c in cluster_names]
+# Use fixed MAX_KEYWORDS_FOR_SUMMARY (slider removed)
+summaries = [build_cluster_summary(c, cluster_groups[c], stops, MAX_KEYWORDS_FOR_SUMMARY) for c in cluster_names]
 
 emb = embed_in_batches(summaries, batch_size=embed_batch_size)
 st.success(f"✅ Embedded {len(cluster_names):,} clusters.")
@@ -329,10 +332,11 @@ for hid, nodes in label_to_nodes.items():
 def make_prompt(centroid_name: str, centroid_summary: str, examples: List[str]) -> str:
     ex = "\n".join(f"- {e}" for e in examples) if examples else "- (none)"
     return f"""
-You are naming a website content hub. Provide a short, navigational, 2–4 word Title Case name.
+You are naming a website content hub. Provide a short, navigational, 1–4 word Title Case name.
+Use one word if it fully represents the topic; otherwise use up to four words to be as descriptive as needed.
 
 Return ONLY this JSON:
-{{"title":"<2-4 word hub name>"}}
+{{"title":"<1-4 word hub name>"}}
 
 Centroid cluster (representative):
 - name: {centroid_name}
@@ -342,9 +346,10 @@ Other example clusters in this hub:
 {ex}
 
 Rules:
-- 2–4 words, Title Case.
+- 1–4 words, Title Case.
+- Use one word if it fully describes the hub; otherwise up to four words for clarity.
 - Avoid generic names like "Misc", "General", "Education".
-- Prefer academic/subject/qualification phrasing that would appear in site navigation.
+- Prefer subject, service, or qualification phrasing that would appear in site navigation.
 - No punctuation beyond spaces. No emojis. No quotes.
 """.strip()
 
