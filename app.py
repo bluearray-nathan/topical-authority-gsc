@@ -1,7 +1,7 @@
 import subprocess
 import sys
 # Ensure Playwright is installed for browser automation
-subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"], check=False)
 
 import time
 import json
