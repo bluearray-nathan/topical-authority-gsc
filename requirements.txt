@@ -1,9 +1,9 @@
+# requirements.txt
 streamlit
 pandas
-numpy
-scikit-learn>=1.2,<1.7
-hdbscan==0.8.40
-tqdm
+requests
+beautifulsoup4
 openai
-google-cloud-aiplatform
-google-genai
+cloudscraper
+playwright
+google-cloud-storage>=2.16.0

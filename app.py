@@ -6,6 +6,7 @@ subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], chec
 import time
 import json
 import re
+import os
 import requests
 import numpy as np
 import streamlit as st
@@ -73,6 +74,7 @@ FUZZY_RATIO       = 92
 EMBED_ON          = True
 EMBED_THRESHOLD   = 0.86
 EMBED_MODEL       = "text-embedding-3-small"
+DEFAULT_USER_AGENT = "QueryFanOutBot/1.0"
 
 # Performance defaults
 MAX_WORKERS       = 6
@@ -87,6 +89,56 @@ NORMALIZE_YEAR_SUFFIX = True
 # --- Load API Keys from Streamlit Secrets ---
 openai.api_key   = st.secrets["openai"]["api_key"]
 gemini_api_key   = st.secrets["google"]["gemini_api_key"]
+
+def _secret_value(path, default=None):
+    current = st.secrets
+    for key in path:
+        if key not in current:
+            return default
+        current = current[key]
+    return current
+
+def get_proxy_url():
+    return (
+        _secret_value(("proxy", "server"))
+        or os.getenv("PROXY_SERVER")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
+    )
+
+def get_proxy_username():
+    return _secret_value(("proxy", "username")) or os.getenv("PROXY_USERNAME")
+
+def get_proxy_password():
+    return _secret_value(("proxy", "password")) or os.getenv("PROXY_PASSWORD")
+
+def get_user_agent():
+    return (
+        _secret_value(("crawler", "user_agent"))
+        or os.getenv("CRAWLER_USER_AGENT")
+        or DEFAULT_USER_AGENT
+    )
+
+def get_requests_proxy_map():
+    proxy_url = get_proxy_url()
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+def get_playwright_proxy_settings():
+    proxy_url = get_proxy_url()
+    if not proxy_url:
+        return None
+    proxy = {"server": proxy_url}
+    username = get_proxy_username()
+    password = get_proxy_password()
+    if username:
+        proxy["username"] = username
+    if password:
+        proxy["password"] = password
+    return proxy
 
 # --- URL Input Area ---
 urls_input = st.text_area(
@@ -359,18 +411,24 @@ def extract_content_fast(url):
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
-    r = scraper.get(url, timeout=20)
+    scraper.headers.update({"User-Agent": get_user_agent()})
+    r = scraper.get(url, timeout=20, proxies=get_requests_proxy_map())
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
 def extract_content_playwright(url):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            proxy=get_playwright_proxy_settings()
+        )
+        context = browser.new_context(user_agent=get_user_agent())
+        page = context.new_page()
         resp = page.goto(url, timeout=45000)
         if resp and resp.status == 403:
             raise RuntimeError("HTTP 403 Forbidden")
         html = page.content()
+        context.close()
         browser.close()
     return BeautifulSoup(html, "html.parser")
 
@@ -704,8 +762,6 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
-
-
 
 
 
